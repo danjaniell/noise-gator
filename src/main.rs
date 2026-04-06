@@ -7,6 +7,7 @@ mod audio;
 mod config;
 mod driver;
 mod dsp;
+mod models;
 mod tray;
 
 use std::sync::Arc;
