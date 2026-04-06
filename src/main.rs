@@ -16,7 +16,7 @@ use clap::Parser;
 use audio::device;
 use audio::pipeline::Pipeline;
 use config::cli::Cli;
-use config::{Config, RuntimeSettings};
+use config::{Config, DenoiseEngine, RuntimeSettings};
 
 fn main() {
     // Parse CLI first (before logging — --list-devices should be clean)
@@ -76,6 +76,13 @@ fn main() {
     }
     if cli.hard_mode {
         config.hard_mode = true;
+    }
+    if let Some(ref eng) = cli.engine {
+        match eng.to_lowercase().as_str() {
+            "deepfilter" | "deep-filter" | "df" => config.engine = DenoiseEngine::DeepFilter,
+            "rnnoise" | "rnn" => config.engine = DenoiseEngine::RNNoise,
+            other => tracing::warn!("Unknown engine '{other}', using default"),
+        }
     }
 
     // ── Ensure virtual audio driver ─────────────────────────────────

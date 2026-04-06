@@ -10,6 +10,26 @@ use crate::dsp::autogain::AutoGainSettings;
 use crate::dsp::eq::EqSettings;
 use crate::dsp::gate::GateSettings;
 
+/// Available noise suppression engines.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenoiseEngine {
+    /// RNNoise via nnnoiseless — lightweight, always available, has neural VAD.
+    #[default]
+    RNNoise,
+    /// DeepFilterNet via tract-onnx — higher quality, requires model download.
+    DeepFilter,
+}
+
+impl std::fmt::Display for DenoiseEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RNNoise => write!(f, "RNNoise"),
+            Self::DeepFilter => write!(f, "DeepFilter"),
+        }
+    }
+}
+
 /// Persisted configuration (TOML file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +39,7 @@ pub struct Config {
     pub virtual_device: Option<String>,
     pub denoise_enabled: bool,
     pub hard_mode: bool,
+    pub engine: DenoiseEngine,
     pub input_gain: f32,
     pub output_gain: f32,
     pub eq: EqSettings,
@@ -34,6 +55,7 @@ impl Default for Config {
             virtual_device: None,
             denoise_enabled: true,
             hard_mode: false,
+            engine: DenoiseEngine::default(),
             input_gain: 1.0,
             output_gain: 1.0,
             eq: EqSettings::default(),
@@ -130,6 +152,8 @@ pub struct RuntimeSettings {
     pub autogain_enabled: AtomicBool,
     pub autogain_target_rms: AtomicU32,
     pub autogain_max_gain: AtomicU32,
+    // Engine selection
+    pub engine: std::sync::atomic::AtomicU8,
 }
 
 impl RuntimeSettings {
@@ -151,6 +175,14 @@ impl RuntimeSettings {
             autogain_enabled: AtomicBool::new(cfg.autogain.enabled),
             autogain_target_rms: AtomicU32::new(cfg.autogain.target_rms.to_bits()),
             autogain_max_gain: AtomicU32::new(cfg.autogain.max_gain.to_bits()),
+            engine: std::sync::atomic::AtomicU8::new(cfg.engine as u8),
+        }
+    }
+
+    pub fn load_engine(&self) -> DenoiseEngine {
+        match self.engine.load(Ordering::Relaxed) {
+            1 => DenoiseEngine::DeepFilter,
+            _ => DenoiseEngine::RNNoise,
         }
     }
 
@@ -192,6 +224,7 @@ impl RuntimeSettings {
             virtual_device: base.virtual_device.clone(),
             denoise_enabled: self.denoise_enabled.load(Ordering::Relaxed),
             hard_mode: self.hard_mode.load(Ordering::Relaxed),
+            engine: self.load_engine(),
             input_gain: f32::from_bits(self.input_gain.load(Ordering::Relaxed)),
             output_gain: f32::from_bits(self.output_gain.load(Ordering::Relaxed)),
             eq: self.load_eq_settings(),

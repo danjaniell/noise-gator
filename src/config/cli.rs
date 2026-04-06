@@ -43,4 +43,8 @@ pub struct Cli {
     /// Run headless (no system tray, useful for scripts)
     #[arg(long)]
     pub headless: bool,
+
+    /// Denoise engine: rnnoise (default) or deepfilter
+    #[arg(long)]
+    pub engine: Option<String>,
 }
