@@ -364,7 +364,6 @@ mod inner {
             }
 
             // Inverse FFT
-            self.fft_forward.clone(); // just to avoid unused warning
             self.fft_inverse.process_with_scratch(&mut ifft_buf, &mut self.fft_scratch);
 
             // Normalize + apply synthesis window + overlap-add

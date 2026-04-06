@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -14,10 +14,21 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
 
       - name: Build
         run: cargo build --verbose
@@ -29,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -38,6 +49,85 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
 
       - name: Check (no default features)
         run: cargo check --no-default-features --verbose
+
+  tag:
+    needs: [ build-windows, check-linux ]
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "current=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current Cargo.toml version: $VERSION"
+
+      - name: Compute next patch version
+        id: next
+        run: |
+          CURRENT="${{ steps.version.outputs.current }}"
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1 || echo "")
+          echo "Latest tag: ${LATEST_TAG:-none}"
+
+          if [ -z "$LATEST_TAG" ]; then
+            # No tags yet — use current Cargo.toml version
+            NEXT="$CURRENT"
+          else
+            # Strip the 'v' prefix
+            TAG_VER="${LATEST_TAG#v}"
+            MAJOR=$(echo "$TAG_VER" | cut -d. -f1)
+            MINOR=$(echo "$TAG_VER" | cut -d. -f2)
+            PATCH=$(echo "$TAG_VER" | cut -d. -f3)
+            NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT"
+
+      - name: Update Cargo.toml version
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          sed -i "0,/^version = .*/s//version = \"${NEXT}\"/" Cargo.toml
+          echo "Cargo.toml updated to $NEXT"
+          head -5 Cargo.toml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - name: Update Cargo.lock
+        run: cargo update --package noise-gator
+
+      - name: Commit and tag
+        run: |
+          NEXT="${{ steps.next.outputs.next }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: bump version to ${NEXT} [skip ci]"
+          git tag "v${NEXT}"
+          git push origin master --tags
