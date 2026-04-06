@@ -249,15 +249,16 @@ pub fn handle_event(
             tracing::info!("Switching to DeepFilterNet...");
             pipeline.stop();
 
-            // Download model if needed (blocking)
+            // Download model if needed (blocking with user notification)
             if !crate::models::is_deepfilter_available() {
-                tracing::info!("Downloading DeepFilterNet model (~8MB)...");
+                show_message("Noise Gator", "Downloading DeepFilterNet model (~8MB).\nThis may take a moment.");
                 match crate::models::ensure_deepfilter_model() {
                     Ok(_) => {
                         tracing::info!("DeepFilterNet model installed.");
                     }
                     Err(e) => {
                         tracing::error!("Model download failed: {e}");
+                        show_message("Noise Gator", &format!("Download failed: {e}"));
                         // Restart with RNNoise
                         let _ = pipeline.start(
                             config.input_device.as_deref(),
@@ -335,4 +336,21 @@ pub fn handle_event(
             return;
         }
     }
+}
+
+/// Show a simple message box. Best-effort — logs on failure.
+#[cfg(target_os = "windows")]
+fn show_message(title: &str, message: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
+    let title = HSTRING::from(title);
+    let message = HSTRING::from(message);
+    unsafe {
+        let _ = MessageBoxW(None, &message, &title, MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_message(_title: &str, message: &str) {
+    tracing::info!("{message}");
 }
