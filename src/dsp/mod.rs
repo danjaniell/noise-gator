@@ -2,6 +2,7 @@ pub mod autogain;
 pub mod denoise;
 pub mod eq;
 pub mod gate;
+pub mod deepfilter;
 pub mod energy_vad;
 pub mod highpass;
 
