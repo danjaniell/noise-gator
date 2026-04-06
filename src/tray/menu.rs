@@ -8,7 +8,7 @@ use winit::event_loop::ActiveEventLoop;
 
 use crate::audio::device;
 use crate::audio::pipeline::Pipeline;
-use crate::config::Config;
+use crate::config::{Config, DenoiseEngine};
 
 /// Holds references to menu items we need to update dynamically.
 pub struct MenuState {
@@ -19,6 +19,8 @@ pub struct MenuState {
     pub quit_id: muda::MenuId,
     pub input_ids: Vec<(muda::MenuId, String)>,
     pub output_ids: Vec<(muda::MenuId, String)>,
+    pub engine_rnnoise_id: muda::MenuId,
+    pub engine_deepfilter_id: muda::MenuId,
 }
 
 pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState) {
@@ -114,6 +116,27 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
+    // ── Engine selection ────────────────────────────────────────────
+    let engine_sub = Submenu::new("Engine", true);
+
+    let is_rnnoise = config.engine == DenoiseEngine::RNNoise;
+    let rnnoise_item = CheckMenuItem::new("RNNoise (default)", true, is_rnnoise, None);
+    let engine_rnnoise_id = rnnoise_item.id().clone();
+    let _ = engine_sub.append(&rnnoise_item);
+
+    let df_label = if crate::models::is_deepfilter_available() {
+        "DeepFilterNet"
+    } else {
+        "DeepFilterNet (Download ~8MB)"
+    };
+    let df_item = CheckMenuItem::new(df_label, true, !is_rnnoise, None);
+    let engine_deepfilter_id = df_item.id().clone();
+    let _ = engine_sub.append(&df_item);
+
+    let _ = menu.append(&engine_sub);
+
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
     // ── Quit ────────────────────────────────────────────────────────
     let quit = MenuItem::new("Quit", true, None);
     let quit_id = quit.id().clone();
@@ -127,6 +150,8 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
         quit_id,
         input_ids,
         output_ids,
+        engine_rnnoise_id,
+        engine_deepfilter_id,
     };
 
     (menu, state)
@@ -198,6 +223,71 @@ pub fn handle_event(
             .eq_enabled
             .store(!current, Ordering::Relaxed);
         tracing::info!("EQ: {}", !current);
+        return;
+    }
+
+    // ── Engine selection ────────────────────────────────────────────
+    if *id == state.engine_rnnoise_id {
+        if config.engine != DenoiseEngine::RNNoise {
+            config.engine = DenoiseEngine::RNNoise;
+            pipeline.settings.engine.store(0, Ordering::Relaxed);
+            tracing::info!("Switching to RNNoise");
+            pipeline.stop();
+            if let Err(e) = pipeline.start(
+                config.input_device.as_deref(),
+                config.output_device.as_deref(),
+                config.virtual_device.as_deref(),
+            ) {
+                tracing::error!("Failed to restart pipeline: {e}");
+            }
+        }
+        return;
+    }
+
+    if *id == state.engine_deepfilter_id {
+        if config.engine != DenoiseEngine::DeepFilter {
+            tracing::info!("Switching to DeepFilterNet...");
+            pipeline.stop();
+
+            // Download model if needed (blocking)
+            if !crate::models::is_deepfilter_available() {
+                tracing::info!("Downloading DeepFilterNet model (~8MB)...");
+                match crate::models::ensure_deepfilter_model() {
+                    Ok(_) => {
+                        tracing::info!("DeepFilterNet model installed.");
+                    }
+                    Err(e) => {
+                        tracing::error!("Model download failed: {e}");
+                        // Restart with RNNoise
+                        let _ = pipeline.start(
+                            config.input_device.as_deref(),
+                            config.output_device.as_deref(),
+                            config.virtual_device.as_deref(),
+                        );
+                        return;
+                    }
+                }
+            }
+
+            config.engine = DenoiseEngine::DeepFilter;
+            pipeline.settings.engine.store(1, Ordering::Relaxed);
+
+            if let Err(e) = pipeline.start(
+                config.input_device.as_deref(),
+                config.output_device.as_deref(),
+                config.virtual_device.as_deref(),
+            ) {
+                tracing::error!("Failed to restart with DeepFilter: {e}");
+                // Fall back to RNNoise
+                config.engine = DenoiseEngine::RNNoise;
+                pipeline.settings.engine.store(0, Ordering::Relaxed);
+                let _ = pipeline.start(
+                    config.input_device.as_deref(),
+                    config.output_device.as_deref(),
+                    config.virtual_device.as_deref(),
+                );
+            }
+        }
         return;
     }
 
