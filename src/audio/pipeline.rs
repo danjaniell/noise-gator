@@ -8,13 +8,15 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 
-use crate::config::RuntimeSettings;
+use crate::config::{DenoiseEngine, RuntimeSettings};
 use crate::dsp::autogain::AutoGain;
+use crate::dsp::deepfilter::DeepFilterProcessor;
 use crate::dsp::denoise::{Denoiser, FRAME_SIZE};
+use crate::dsp::energy_vad::EnergyVad;
 use crate::dsp::eq::ThreeBandEq;
 use crate::dsp::gate::NoiseGate;
 use crate::dsp::highpass::HighPassFilter;
-use crate::dsp::Processor;
+use crate::dsp::{ProcessResult, Processor};
 
 use super::device;
 use super::resample::{resample_linear_into, StreamResampler};
@@ -231,7 +233,31 @@ impl Pipeline {
 
         // ── Input callback (DSP chain) ──────────────────────────────────
         let mut highpass = HighPassFilter::default_80hz();
-        let mut denoiser = Denoiser::new();
+        let engine = self.settings.load_engine();
+        let mut rnnoise_denoiser: Option<Denoiser> = None;
+        let mut deepfilter_denoiser: Option<DeepFilterProcessor> = None;
+        let mut energy_vad: Option<EnergyVad> = None;
+
+        match engine {
+            DenoiseEngine::RNNoise => {
+                rnnoise_denoiser = Some(Denoiser::new());
+            }
+            DenoiseEngine::DeepFilter => {
+                match crate::models::ensure_deepfilter_model()
+                    .and_then(|dir| DeepFilterProcessor::from_model_dir(&dir))
+                {
+                    Ok(df) => {
+                        deepfilter_denoiser = Some(df);
+                        energy_vad = Some(EnergyVad::new());
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load DeepFilter, falling back to RNNoise: {e}");
+                        rnnoise_denoiser = Some(Denoiser::new());
+                    }
+                }
+            }
+        }
+        tracing::info!("Engine: {engine}");
         let eq_settings = self.settings.load_eq_settings();
         let mut eq = ThreeBandEq::new(rnnoise_rate, eq_settings);
         let gate_settings = self.settings.load_gate_settings();
@@ -326,10 +352,25 @@ impl Pipeline {
                     highpass.process(&mut frame);
 
                     if denoise_on {
-                        let result = denoiser.process(&mut frame);
+                        // Run the active denoise engine
+                        let result = if let Some(ref mut df) = deepfilter_denoiser {
+                            df.process(&mut frame)
+                        } else if let Some(ref mut rnn) = rnnoise_denoiser {
+                            rnn.process(&mut frame)
+                        } else {
+                            ProcessResult::default()
+                        };
+
+                        // VAD: neural from RNNoise, energy-based from DeepFilter
                         if let Some(vad) = result.vad {
                             gate.set_vad(vad);
+                        } else if let Some(ref mut evad) = energy_vad {
+                            let vad_result = evad.process(&mut frame);
+                            if let Some(vad) = vad_result.vad {
+                                gate.set_vad(vad);
+                            }
                         }
+
                         gate.process(&mut frame);
                         eq.process(&mut frame);
                         autogain.process(&mut frame);
