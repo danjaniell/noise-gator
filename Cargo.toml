@@ -29,7 +29,7 @@ tray-icon = "0.22"
 muda = "0.17"
 
 # Event loop for tray (cross-platform)
-winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }

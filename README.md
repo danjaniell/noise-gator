@@ -19,11 +19,11 @@
 
 Noise Gator is a standalone system tray application that captures your microphone input, runs it through a real-time noise suppression pipeline, and routes the clean audio to a virtual audio device. Other applications (Discord, Teams, Zoom) pick up the virtual device as their microphone input.
 
-No Electron. No web runtime. A single 5MB binary.
+No Electron. No web runtime. A single ~23MB binary.
 
 ## Features
 
-- **Dual denoise engines** -- [RNNoise](https://github.com/jmvalin/rnnoise) (default, bundled) and [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (optional, downloaded on first use)
+- **Dual denoise engines** -- [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (default) and [RNNoise](https://github.com/xiph/rnnoise) (lightweight fallback)
 - **DSP pipeline** -- Highpass pre-filter, noise suppression, VAD-driven noise gate, 3-band EQ, auto-gain normalization
 - **System tray control** -- Start/stop, device selection, engine switching, DSP toggles -- all from the tray menu
 - **Virtual audio driver** -- Auto-installs [VB-Cable](https://vb-audio.com/Cable/) on Windows or [BlackHole](https://existential.audio/blackhole/) on macOS
@@ -63,10 +63,10 @@ cargo build --release
 
 The binary is at `target/release/noise-gator.exe`.
 
-To include DeepFilterNet support:
+To build without DeepFilterNet (RNNoise only, smaller binary):
 
 ```bash
-cargo build --release --features deepfilter
+cargo build --release --no-default-features
 ```
 
 ## Usage
@@ -95,10 +95,10 @@ noise-gator --skip-driver
 
 | Engine | Quality | Size | VAD | Availability |
 |--------|---------|------|-----|-------------|
-| [RNNoise](https://github.com/jmvalin/rnnoise) | Good | Bundled (0MB extra) | Neural | Always available |
-| [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | Superior | ~8MB download | Energy-based | On-demand via tray menu |
+| [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | Superior | ~8MB model download on first use | Energy-based | Default |
+| [RNNoise](https://github.com/xiph/rnnoise) | Good | Bundled (0MB extra) | Neural | Always available |
 
-RNNoise is the default. DeepFilterNet can be selected from the system tray Engine menu. On first selection, the ONNX model (~8MB) downloads automatically.
+DeepFilterNet is the default engine. On first use, the ONNX model (~8MB) downloads automatically. RNNoise is available as a lightweight fallback and can be selected from the system tray Engine menu. Build with `--no-default-features` to exclude DeepFilterNet entirely.
 
 ## Configuration
 
