@@ -50,7 +50,11 @@ impl Processor for EnergyVad {
         };
         self.smoothed_rms = coeff * self.smoothed_rms + (1.0 - coeff) * rms;
 
-        let vad = if self.smoothed_rms >= self.threshold { 1.0 } else { 0.0 };
+        let vad = if self.smoothed_rms >= self.threshold {
+            1.0
+        } else {
+            0.0
+        };
 
         // Does NOT modify samples — measurement-only processor
         ProcessResult { vad: Some(vad) }

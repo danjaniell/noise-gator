@@ -9,6 +9,7 @@ mod driver;
 mod dsp;
 mod models;
 mod tray;
+mod ui;
 
 use std::sync::Arc;
 

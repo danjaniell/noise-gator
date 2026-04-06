@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host, SampleFormat, SupportedStreamConfig};
 
@@ -18,6 +18,17 @@ const VIRTUAL_DEVICE_PATTERNS: &[&str] = &[
 pub struct AudioDevice {
     pub name: String,
     pub is_default: bool,
+}
+
+impl AudioDevice {
+    /// Formatted name for UI display (appends "(default)" when applicable).
+    pub fn display_name(&self) -> String {
+        if self.is_default {
+            format!("{} (default)", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 /// Enumerate input (microphone) devices. Excludes known virtual devices to
@@ -104,14 +115,17 @@ pub fn find_output(name: Option<&str>) -> Result<Device> {
 
 fn find_device(host: &Host, name: Option<&str>, is_input: bool) -> Result<Device> {
     match name {
-        None => {
-            if is_input {
-                host.default_input_device()
-            } else {
-                host.default_output_device()
-            }
-            .ok_or_else(|| anyhow!("No default {} device", if is_input { "input" } else { "output" }))
+        None => if is_input {
+            host.default_input_device()
+        } else {
+            host.default_output_device()
         }
+        .ok_or_else(|| {
+            anyhow!(
+                "No default {} device",
+                if is_input { "input" } else { "output" }
+            )
+        }),
         Some(id) => {
             let devices: Vec<_> = if is_input {
                 host.input_devices()?.collect()
@@ -121,7 +135,10 @@ fn find_device(host: &Host, name: Option<&str>, is_input: bool) -> Result<Device
             let kind = if is_input { "Input" } else { "Output" };
 
             // Exact match first
-            if let Some(d) = devices.iter().find(|d| device_name(d).map(|n| n == id).unwrap_or(false)) {
+            if let Some(d) = devices
+                .iter()
+                .find(|d| device_name(d).map(|n| n == id).unwrap_or(false))
+            {
                 return Ok(d.clone());
             }
 
@@ -136,7 +153,8 @@ fn find_device(host: &Host, name: Option<&str>, is_input: bool) -> Result<Device
                     }
                     let n_lower = n.to_lowercase();
                     if id_lower.contains(&n_lower) || n_lower.contains(&id_lower) {
-                        let is_better = best.as_ref().map_or(true, |(_, prev)| n.len() > prev.len());
+                        let is_better =
+                            best.as_ref().map_or(true, |(_, prev)| n.len() > prev.len());
                         if is_better {
                             best = Some((d, n));
                         }

@@ -67,6 +67,15 @@ tar = "0.4"
 # PNG decoding for tray icon
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Settings window GUI (egui rendered via glow into a glutin-managed GL context)
+egui = { version = "0.31", features = ["default_fonts"] }
+egui-winit = "0.31"
+egui_glow = { version = "0.31", features = ["winit"] }
+glow = "0.16"
+glutin = "0.32"
+glutin-winit = "0.5"
+raw-window-handle = "0.6"
+
 # Platform-specific
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

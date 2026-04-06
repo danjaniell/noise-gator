@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use anyhow::Result;
@@ -19,13 +19,16 @@ use crate::dsp::highpass::HighPassFilter;
 use crate::dsp::{ProcessResult, Processor};
 
 use super::device;
-use super::resample::{resample_linear_into, StreamResampler};
+use super::resample::{StreamResampler, resample_linear_into};
 
 /// Monotonically increasing pipeline ID — used to invalidate stale audio callbacks.
 static PIPELINE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Current RMS audio level (f32 bits stored in AtomicU32).
 pub static AUDIO_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// Current output RMS audio level (f32 bits stored in AtomicU32).
+pub static OUTPUT_LEVEL: AtomicU32 = AtomicU32::new(0);
 
 /// Thread-safe pipeline handle. Dropping it stops the audio streams.
 struct PipelineInner {
@@ -108,7 +111,10 @@ impl Pipeline {
 
         tracing::info!(
             "Input: {} | {} ch | {} Hz | {:?}",
-            input_device.description().map(|d| d.name().to_string()).unwrap_or_default(),
+            input_device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_default(),
             in_channels,
             in_cfg.sample_rate,
             in_supported.sample_format()
@@ -323,8 +329,8 @@ impl Pipeline {
 
                 // 3. RMS level for tray indicator
                 if !at_48k.is_empty() {
-                    let rms = (at_48k.iter().map(|s| s * s).sum::<f32>() / at_48k.len() as f32)
-                        .sqrt();
+                    let rms =
+                        (at_48k.iter().map(|s| s * s).sum::<f32>() / at_48k.len() as f32).sqrt();
                     AUDIO_LEVEL.store(rms.to_bits(), Ordering::Relaxed);
                 }
 
@@ -336,11 +342,19 @@ impl Pipeline {
                 }
 
                 // 5. Process complete frames
-                // Pick up live setting changes
-                gate.set_enabled(input_settings.hard_mode.load(Ordering::Relaxed));
+                // Pick up live setting changes (once per callback, not per frame)
+                // Gate enabled/disabled is now controlled by gate_floor (1.0 = bypass).
+                // hard_mode atomic is retained for config compat but no longer drives set_enabled.
+                let gate_floor = f32::from_bits(
+                    input_settings.gate_floor.load(Ordering::Relaxed),
+                );
+                gate.set_enabled(gate_floor < 1.0);
                 gate.update_settings(input_settings.load_gate_settings());
                 eq.update_settings(input_settings.load_eq_settings());
                 autogain.update_settings(input_settings.load_autogain_settings());
+                let suppression = f32::from_bits(
+                    input_settings.suppression_level.load(Ordering::Relaxed),
+                );
 
                 let mut read_pos = 0;
                 while read_pos + FRAME_SIZE <= accumulator.len() {
@@ -352,6 +366,15 @@ impl Pipeline {
                     highpass.process(&mut frame);
 
                     if denoise_on {
+                        // Capture dry signal before denoise (only when mixing needed)
+                        let dry_frame = if suppression < 1.0 {
+                            let mut buf = [0f32; FRAME_SIZE];
+                            buf.copy_from_slice(&frame);
+                            Some(buf)
+                        } else {
+                            None
+                        };
+
                         // Run the active denoise engine
                         let result = if let Some(ref mut df) = deepfilter_denoiser {
                             df.process(&mut frame)
@@ -360,6 +383,14 @@ impl Pipeline {
                         } else {
                             ProcessResult::default()
                         };
+
+                        // Wet/dry mix BEFORE gate so noise doesn't leak through
+                        // NOTE: mix is intentionally inside denoise_on
+                        if let Some(ref dry) = dry_frame {
+                            for (wet, d) in frame.iter_mut().zip(dry.iter()) {
+                                *wet = d * (1.0 - suppression) + *wet * suppression;
+                            }
+                        }
 
                         // VAD: neural from RNNoise, energy-based from DeepFilter
                         if let Some(vad) = result.vad {
@@ -371,10 +402,16 @@ impl Pipeline {
                             }
                         }
 
+                        // DSP chain runs on the mixed signal
                         gate.process(&mut frame);
                         eq.process(&mut frame);
                         autogain.process(&mut frame);
                     }
+
+                    // Output level for UI meter (always, regardless of denoise state)
+                    let out_rms =
+                        (frame.iter().map(|s| s * s).sum::<f32>() / FRAME_SIZE as f32).sqrt();
+                    OUTPUT_LEVEL.store(out_rms.to_bits(), Ordering::Relaxed);
 
                     // Push to virtual device
                     if let Some((vrate, ref mut prod)) = virt_prod {
@@ -432,6 +469,7 @@ impl Pipeline {
             drop(prev);
             std::thread::sleep(std::time::Duration::from_millis(50));
             AUDIO_LEVEL.store(0f32.to_bits(), Ordering::Relaxed);
+            OUTPUT_LEVEL.store(0f32.to_bits(), Ordering::Relaxed);
             tracing::info!("Pipeline stopped");
         }
     }

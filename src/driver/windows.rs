@@ -1,30 +1,26 @@
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// VB-Cable download URL (official VB-Audio site).
-const VBCABLE_URL: &str = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip";
+const VBCABLE_URL: &str = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip";
 
 pub fn is_installed() -> bool {
     let host = cpal::default_host();
-    host.input_devices()
-        .ok()
-        .is_some_and(|mut devs| {
-            devs.any(|d| {
-                d.description()
-                    .map(|desc| {
-                        let n = desc.name();
-                        n.contains("NoiseGator")
-                            || n.contains("CABLE")
-                            || n.contains("VB-Audio")
-                    })
-                    .unwrap_or(false)
-            })
+    host.input_devices().ok().is_some_and(|mut devs| {
+        devs.any(|d| {
+            d.description()
+                .map(|desc| {
+                    let n = desc.name();
+                    n.contains("NoiseGator") || n.contains("CABLE") || n.contains("VB-Audio")
+                })
+                .unwrap_or(false)
         })
+    })
 }
 
 pub fn download_and_install() -> Result<()> {

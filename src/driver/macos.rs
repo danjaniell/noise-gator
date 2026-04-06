@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 const DRIVER_NAME: &str = "NoiseGatorDriver.driver";
 const INSTALL_DIR: &str = "/Library/Audio/Plug-Ins/HAL";

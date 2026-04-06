@@ -1,9 +1,9 @@
 pub mod autogain;
+pub mod deepfilter;
 pub mod denoise;
+pub mod energy_vad;
 pub mod eq;
 pub mod gate;
-pub mod deepfilter;
-pub mod energy_vad;
 pub mod highpass;
 
 /// Trait for any DSP processor that operates on audio frames in-place.

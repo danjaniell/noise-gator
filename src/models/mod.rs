@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 const DEEPFILTER_MODEL_URL: &str =
     "https://github.com/Rikorose/DeepFilterNet/raw/main/models/DeepFilterNet3_onnx.tar.gz";
@@ -27,7 +27,10 @@ pub fn ensure_deepfilter_model() -> Result<PathBuf> {
     let model_dir = deepfilter_model_dir();
 
     if is_deepfilter_available() {
-        tracing::info!("DeepFilterNet model already cached at {}", model_dir.display());
+        tracing::info!(
+            "DeepFilterNet model already cached at {}",
+            model_dir.display()
+        );
         return Ok(model_dir);
     }
 
@@ -37,7 +40,10 @@ pub fn ensure_deepfilter_model() -> Result<PathBuf> {
         .map_err(|e| anyhow!("Failed to download DeepFilterNet model: {e}"))?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("Model download failed with status: {}", response.status()));
+        return Err(anyhow!(
+            "Model download failed with status: {}",
+            response.status()
+        ));
     }
 
     let bytes = response

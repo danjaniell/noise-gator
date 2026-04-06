@@ -10,9 +10,9 @@ mod inner {
     use std::path::Path;
     use std::sync::Arc;
 
-    use anyhow::{anyhow, Result};
+    use anyhow::{Result, anyhow};
     use ndarray::Array4;
-    use rustfft::{num_complex::Complex32, FftPlanner};
+    use rustfft::{FftPlanner, num_complex::Complex32};
     use tract_onnx::prelude::*;
 
     use super::{ProcessResult, Processor};
@@ -30,8 +30,8 @@ mod inner {
     /// Each band spans a range of frequency bins. Precomputed from the
     /// DeepFilterNet erb_fb() function with min_nb_erb_freqs=2.
     static ERB_WIDTHS: [usize; NB_ERB] = [
-        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5,
-        5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20, 23, 26, 30, 35, 39,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20, 23,
+        26, 30, 35, 39,
     ];
 
     type TractModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
@@ -48,16 +48,16 @@ mod inner {
         analysis_window: Vec<f32>,
         synthesis_window: Vec<f32>,
         // State buffers
-        input_buf: Vec<f32>,          // ring buffer for overlap
-        output_buf: Vec<f32>,         // overlap-add output
+        input_buf: Vec<f32>,  // ring buffer for overlap
+        output_buf: Vec<f32>, // overlap-add output
         fft_scratch: Vec<Complex32>,
         spectrum: Vec<Complex32>,
         // Rolling DF buffer: last DF_ORDER frames of first NB_DF bins
         df_buf: Vec<Vec<Complex32>>,
         // Normalization state
-        erb_norm_state: f32,          // running mean for ERB normalization
-        spec_norm_state: Vec<f32>,    // running norm per DF bin
-        alpha: f32,                   // smoothing coefficient
+        erb_norm_state: f32,       // running mean for ERB normalization
+        spec_norm_state: Vec<f32>, // running norm per DF bin
+        alpha: f32,                // smoothing coefficient
         // Position tracking
         frame_count: usize,
     }
@@ -73,7 +73,10 @@ mod inner {
             let df_dec_path = model_dir.join("df_dec.onnx");
 
             if !enc_path.exists() || !erb_dec_path.exists() || !df_dec_path.exists() {
-                return Err(anyhow!("Missing ONNX model files in {}", model_dir.display()));
+                return Err(anyhow!(
+                    "Missing ONNX model files in {}",
+                    model_dir.display()
+                ));
             }
 
             // Load models with tract — optimize for inference
@@ -136,12 +139,15 @@ mod inner {
             self.input_buf[FFT_SIZE - HOP_SIZE..].copy_from_slice(frame);
 
             // Apply analysis window and FFT
-            let mut fft_buf: Vec<Complex32> = self.input_buf.iter()
+            let mut fft_buf: Vec<Complex32> = self
+                .input_buf
+                .iter()
                 .zip(&self.analysis_window)
                 .map(|(&s, &w)| Complex32::new(s * w, 0.0))
                 .collect();
 
-            self.fft_forward.process_with_scratch(&mut fft_buf, &mut self.fft_scratch);
+            self.fft_forward
+                .process_with_scratch(&mut fft_buf, &mut self.fft_scratch);
 
             // Store spectrum (only positive frequencies)
             self.spectrum[..FREQ_SIZE].copy_from_slice(&fft_buf[..FREQ_SIZE]);
@@ -230,8 +236,8 @@ mod inner {
                 let norm_sqr = c.norm_sqr();
 
                 // Update running normalization
-                self.spec_norm_state[i] = self.alpha * self.spec_norm_state[i]
-                    + (1.0 - self.alpha) * norm_sqr;
+                self.spec_norm_state[i] =
+                    self.alpha * self.spec_norm_state[i] + (1.0 - self.alpha) * norm_sqr;
 
                 let norm = (self.spec_norm_state[i] + 1e-10).sqrt();
                 features.push([c.re / norm, c.im / norm]);
@@ -241,18 +247,16 @@ mod inner {
 
         fn run_encoder(&self, erb: &[f32; NB_ERB], spec: &[[f32; 2]]) -> Result<EncoderOutput> {
             // feat_erb: [1, 1, 1, 32]
-            let erb_tensor: Tensor = Array4::from_shape_fn((1, 1, 1, NB_ERB), |(_, _, _, i)| erb[i])
-                .into();
+            let erb_tensor: Tensor =
+                Array4::from_shape_fn((1, 1, 1, NB_ERB), |(_, _, _, i)| erb[i]).into();
 
             // feat_spec: [1, 2, 1, 96]
-            let spec_tensor: Tensor = Array4::from_shape_fn((1, 2, 1, NB_DF), |(_, ch, _, i)| {
-                spec[i][ch]
-            }).into();
+            let spec_tensor: Tensor =
+                Array4::from_shape_fn((1, 2, 1, NB_DF), |(_, ch, _, i)| spec[i][ch]).into();
 
-            let result = self.encoder.run(tvec![
-                erb_tensor.into(),
-                spec_tensor.into(),
-            ])?;
+            let result = self
+                .encoder
+                .run(tvec![erb_tensor.into(), spec_tensor.into(),])?;
 
             // Outputs: e0, e1, e2, e3, emb, c0, lsnr
             Ok(EncoderOutput {
@@ -277,27 +281,18 @@ mod inner {
             ])?;
 
             // Output: gain mask [1, 1, 1, 32]
-            let gains: Vec<f32> = result[0]
-                .to_array_view::<f32>()?
-                .iter()
-                .copied()
-                .collect();
+            let gains: Vec<f32> = result[0].to_array_view::<f32>()?.iter().copied().collect();
             Ok(gains)
         }
 
         fn run_df_decoder(&self, enc: &EncoderOutput) -> Result<Vec<[Complex32; DF_ORDER]>> {
             // Inputs: emb, c0
-            let result = self.df_decoder.run(tvec![
-                enc.emb.clone(),
-                enc.c0.clone(),
-            ])?;
+            let result = self
+                .df_decoder
+                .run(tvec![enc.emb.clone(), enc.c0.clone(),])?;
 
             // Output: coefficients reshaped to [NB_DF, DF_ORDER, 2] (real/imag)
-            let raw: Vec<f32> = result[0]
-                .to_array_view::<f32>()?
-                .iter()
-                .copied()
-                .collect();
+            let raw: Vec<f32> = result[0].to_array_view::<f32>()?.iter().copied().collect();
 
             let mut coefs = Vec::with_capacity(NB_DF);
             for i in 0..NB_DF {
@@ -364,7 +359,8 @@ mod inner {
             }
 
             // Inverse FFT
-            self.fft_inverse.process_with_scratch(&mut ifft_buf, &mut self.fft_scratch);
+            self.fft_inverse
+                .process_with_scratch(&mut ifft_buf, &mut self.fft_scratch);
 
             // Normalize + apply synthesis window + overlap-add
             let norm = 1.0 / FFT_SIZE as f32;

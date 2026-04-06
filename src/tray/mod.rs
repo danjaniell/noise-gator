@@ -1,16 +1,18 @@
 mod menu;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tray_icon::TrayIconBuilder;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
 use crate::audio::pipeline::Pipeline;
 use crate::config::Config;
+use crate::ui::window::SettingsWindowState;
 
 use menu::MenuState;
 
@@ -23,6 +25,8 @@ pub fn run(pipeline: Arc<Pipeline>, config: Config) -> Result<()> {
         config,
         menu_state: None,
         _tray_icon: None,
+        settings_window: None,
+        open_settings: false,
     };
 
     event_loop.run_app(&mut app)?;
@@ -34,6 +38,8 @@ struct TrayApp {
     config: Config,
     menu_state: Option<MenuState>,
     _tray_icon: Option<tray_icon::TrayIcon>,
+    settings_window: Option<SettingsWindowState>,
+    open_settings: bool,
 }
 
 impl ApplicationHandler for TrayApp {
@@ -66,23 +72,73 @@ impl ApplicationHandler for TrayApp {
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        _event: WindowEvent,
+        window_id: WindowId,
+        event: WindowEvent,
     ) {
+        let is_settings = self
+            .settings_window
+            .as_ref()
+            .is_some_and(|sw| sw.window_id() == window_id);
+
+        if !is_settings {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => {
+                self.settings_window.take(); // Drop impl handles cleanup
+                tracing::info!("Settings window closed");
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(ref mut sw) = self.settings_window {
+                    sw.render();
+                }
+            }
+            ref other => {
+                if let Some(ref mut sw) = self.settings_window {
+                    sw.on_window_event(other);
+                }
+            }
+        }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Process tray menu events
-        if let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Drain all pending menu events
+        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             if let Some(ref menu_state) = self.menu_state {
-                menu::handle_event(
-                    &event,
-                    menu_state,
-                    &self.pipeline,
-                    &mut self.config,
-                    _event_loop,
+                if *event.id() == menu_state.settings_id {
+                    self.open_settings = true;
+                } else {
+                    menu::handle_event(
+                        &event,
+                        menu_state,
+                        &self.pipeline,
+                        &mut self.config,
+                        event_loop,
+                    );
+                }
+            }
+        }
+
+        // Open settings window after processing events (needs ActiveEventLoop)
+        if self.open_settings {
+            self.open_settings = false;
+            if self.settings_window.is_none() {
+                tracing::info!("Opening settings window");
+                self.settings_window = SettingsWindowState::new(
+                    event_loop,
+                    Arc::clone(&self.pipeline.settings),
+                    Arc::clone(&self.pipeline),
                 );
             }
+        }
+
+        // Drive meter animation when settings window is open
+        if let Some(ref sw) = self.settings_window {
+            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(33)));
+            sw.request_redraw();
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }

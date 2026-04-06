@@ -45,6 +45,8 @@ pub struct Config {
     pub eq: EqSettings,
     pub gate: GateSettings,
     pub autogain: AutoGainSettings,
+    pub suppression_level: f32,
+    pub advanced_eq: bool,
 }
 
 impl Default for Config {
@@ -61,6 +63,8 @@ impl Default for Config {
             eq: EqSettings::default(),
             gate: GateSettings::default(),
             autogain: AutoGainSettings::default(),
+            suppression_level: 0.75,
+            advanced_eq: false,
         }
     }
 }
@@ -154,6 +158,9 @@ pub struct RuntimeSettings {
     pub autogain_max_gain: AtomicU32,
     // Engine selection
     pub engine: std::sync::atomic::AtomicU8,
+    pub suppression_level: AtomicU32,
+    // UI preference (not read by audio thread)
+    pub advanced_eq: AtomicBool,
 }
 
 impl RuntimeSettings {
@@ -176,6 +183,8 @@ impl RuntimeSettings {
             autogain_target_rms: AtomicU32::new(cfg.autogain.target_rms.to_bits()),
             autogain_max_gain: AtomicU32::new(cfg.autogain.max_gain.to_bits()),
             engine: std::sync::atomic::AtomicU8::new(cfg.engine as u8),
+            suppression_level: AtomicU32::new(cfg.suppression_level.to_bits()),
+            advanced_eq: AtomicBool::new(cfg.advanced_eq),
         }
     }
 
@@ -230,6 +239,8 @@ impl RuntimeSettings {
             eq: self.load_eq_settings(),
             gate: self.load_gate_settings(),
             autogain: self.load_autogain_settings(),
+            suppression_level: f32::from_bits(self.suppression_level.load(Ordering::Relaxed)),
+            advanced_eq: self.advanced_eq.load(Ordering::Relaxed),
         }
     }
 }

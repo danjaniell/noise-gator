@@ -1,9 +1,7 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use muda::{
-    CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
-};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use winit::event_loop::ActiveEventLoop;
 
 use crate::audio::device;
@@ -14,8 +12,8 @@ use crate::config::{Config, DenoiseEngine};
 pub struct MenuState {
     pub toggle_id: muda::MenuId,
     pub denoise_id: muda::MenuId,
-    pub hard_mode_id: muda::MenuId,
     pub eq_enabled_id: muda::MenuId,
+    pub settings_id: muda::MenuId,
     pub quit_id: muda::MenuId,
     pub input_ids: Vec<(muda::MenuId, String)>,
     pub output_ids: Vec<(muda::MenuId, String)>,
@@ -28,11 +26,7 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
 
     // ── Toggle on/off ───────────────────────────────────────────────
     let is_running = pipeline.is_running();
-    let toggle = MenuItem::new(
-        if is_running { "Stop" } else { "Start" },
-        true,
-        None,
-    );
+    let toggle = MenuItem::new(if is_running { "Stop" } else { "Start" }, true, None);
     let toggle_id = toggle.id().clone();
     let _ = menu.append(&toggle);
 
@@ -43,16 +37,11 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
     let mut input_ids = Vec::new();
     if let Ok(devices) = device::list_input_devices() {
         for dev in &devices {
-            let label = if dev.is_default {
-                format!("{} (default)", dev.name)
-            } else {
-                dev.name.clone()
-            };
             let is_selected = config
                 .input_device
                 .as_deref()
                 .map_or(dev.is_default, |s| s == dev.name);
-            let item = CheckMenuItem::new(&label, true, is_selected, None);
+            let item = CheckMenuItem::new(&dev.display_name(), true, is_selected, None);
             input_ids.push((item.id().clone(), dev.name.clone()));
             let _ = input_sub.append(&item);
         }
@@ -96,15 +85,6 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
     let denoise_id = denoise.id().clone();
     let _ = menu.append(&denoise);
 
-    let hard_mode = CheckMenuItem::new(
-        "Hard Mode (aggressive gate)",
-        true,
-        pipeline.settings.hard_mode.load(Ordering::Relaxed),
-        None,
-    );
-    let hard_mode_id = hard_mode.id().clone();
-    let _ = menu.append(&hard_mode);
-
     let eq_enabled = CheckMenuItem::new(
         "EQ (warmth correction)",
         true,
@@ -137,6 +117,11 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
+    // ── Settings window ────────────────────────────────────────────
+    let settings_item = MenuItem::new("Settings...", true, None);
+    let settings_id = settings_item.id().clone();
+    let _ = menu.append(&settings_item);
+
     // ── Quit ────────────────────────────────────────────────────────
     let quit = MenuItem::new("Quit", true, None);
     let quit_id = quit.id().clone();
@@ -145,8 +130,8 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
     let state = MenuState {
         toggle_id,
         denoise_id,
-        hard_mode_id,
         eq_enabled_id,
+        settings_id,
         quit_id,
         input_ids,
         output_ids,
@@ -204,16 +189,8 @@ pub fn handle_event(
         return;
     }
 
-    // ── Hard mode toggle ────────────────────────────────────────────
-    if *id == state.hard_mode_id {
-        let current = pipeline.settings.hard_mode.load(Ordering::Relaxed);
-        pipeline
-            .settings
-            .hard_mode
-            .store(!current, Ordering::Relaxed);
-        tracing::info!("Hard mode: {}", !current);
-        return;
-    }
+    // ── Settings window ────────────────────────────────────────────
+    // Handled by TrayApp via the open_settings flag — see tray/mod.rs
 
     // ── EQ toggle ───────────────────────────────────────────────────
     if *id == state.eq_enabled_id {
@@ -251,7 +228,10 @@ pub fn handle_event(
 
             // Download model if needed (blocking with user notification)
             if !crate::models::is_deepfilter_available() {
-                show_message("Noise Gator", "Downloading DeepFilterNet model (~8MB).\nThis may take a moment.");
+                show_message(
+                    "Noise Gator",
+                    "Downloading DeepFilterNet model (~8MB).\nThis may take a moment.",
+                );
                 match crate::models::ensure_deepfilter_model() {
                     Ok(_) => {
                         tracing::info!("DeepFilterNet model installed.");
@@ -341,8 +321,8 @@ pub fn handle_event(
 /// Show a simple message box. Best-effort — logs on failure.
 #[cfg(target_os = "windows")]
 fn show_message(title: &str, message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
     use windows::core::HSTRING;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
     let title = HSTRING::from(title);
     let message = HSTRING::from(message);
     unsafe {

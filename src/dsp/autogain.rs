@@ -81,8 +81,8 @@ impl Processor for AutoGain {
         let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
 
         // Smooth the RMS measurement
-        self.smoothed_rms =
-            self.settings.rms_smoothing * self.smoothed_rms + (1.0 - self.settings.rms_smoothing) * rms;
+        self.smoothed_rms = self.settings.rms_smoothing * self.smoothed_rms
+            + (1.0 - self.settings.rms_smoothing) * rms;
 
         // Calculate target gain
         let target_gain = if self.smoothed_rms < self.settings.silence_threshold {
