@@ -87,29 +87,13 @@ impl ApplicationHandler for TrayApp {
     }
 }
 
-/// Generate a simple colored icon in memory (no external file needed).
+/// Load the app icon from the embedded PNG for use as the system tray icon.
 fn load_icon() -> tray_icon::Icon {
-    let size = 32u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-
-    // Draw a green circle on transparent background
-    let center = size as f32 / 2.0;
-    let radius = center - 2.0;
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let idx = ((y * size + x) * 4) as usize;
-            if dist <= radius {
-                // Green: #4CAF50
-                rgba[idx] = 0x4C;     // R
-                rgba[idx + 1] = 0xAF; // G
-                rgba[idx + 2] = 0x50; // B
-                rgba[idx + 3] = 0xFF; // A
-            }
-        }
-    }
-
-    tray_icon::Icon::from_rgba(rgba, size, size).expect("Failed to create tray icon")
+    let png_bytes = include_bytes!("../../img/noise-gator.png");
+    let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
+        .expect("Failed to decode embedded icon PNG");
+    let resized = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
+    let rgba = resized.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).expect("Failed to create tray icon")
 }

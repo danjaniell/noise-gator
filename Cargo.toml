@@ -64,6 +64,9 @@ sha2 = { version = "0.10", optional = true }
 flate2 = "1"
 tar = "0.4"
 
+# PNG decoding for tray icon
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # Platform-specific
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -75,6 +78,9 @@ windows = { version = "0.62", features = [
 [features]
 default = []
 deepfilter = ["dep:tract-onnx", "dep:rustfft", "dep:ndarray", "dep:sha2"]
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3
