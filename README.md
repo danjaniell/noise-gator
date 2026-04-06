@@ -9,9 +9,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey" alt="Platform">
-  <img src="https://img.shields.io/github/license/danjaniell/noise-gator" alt="License">
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange" alt="Rust Version">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey?style=for-the-badge" alt="Platform">
+  <img src="https://img.shields.io/github/license/danjaniell/noise-gator?style=for-the-badge" alt="License">
+  <img src="https://img.shields.io/badge/vibe-coded-00C2FF?style=for-the-badge&logo=gnubash&logoColor=black" alt="Vibe Label">
+  <img src="https://img.shields.io/badge/rust-1.85%2B-orange?style=for-the-badge" alt="Rust Version">
 </p>
 
 ---
