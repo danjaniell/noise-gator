@@ -70,6 +70,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.next.outputs.next }}
+      tagged: ${{ steps.commit.outputs.tagged }}
 
     steps:
       - uses: actions/checkout@v5
@@ -92,10 +95,8 @@ jobs:
           echo "Latest tag: ${LATEST_TAG:-none}"
 
           if [ -z "$LATEST_TAG" ]; then
-            # No tags yet — use current Cargo.toml version
             NEXT="$CURRENT"
           else
-            # Strip the 'v' prefix
             TAG_VER="${LATEST_TAG#v}"
             MAJOR=$(echo "$TAG_VER" | cut -d. -f1)
             MINOR=$(echo "$TAG_VER" | cut -d. -f2)
@@ -122,12 +123,95 @@ jobs:
         run: cargo update --package noise-gator
 
       - name: Commit and tag
+        id: commit
         run: |
           NEXT="${{ steps.next.outputs.next }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: bump version to ${NEXT} [skip ci]"
-          git tag "v${NEXT}"
-          git push origin master --tags
+
+          # Commit version bump if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump version to ${NEXT} [skip ci]"
+          fi
+
+          # Always tag + push if the tag doesn't already exist
+          if git rev-parse "v${NEXT}" >/dev/null 2>&1; then
+            echo "Tag v${NEXT} already exists, skipping"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          else
+            git tag "v${NEXT}"
+            git push origin master --tags
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-build:
+    needs: tag
+    if: needs.tag.outputs.tagged == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: noise-gator.exe
+            platform: windows
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: noise-gator
+            platform: macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: v${{ needs.tag.outputs.version }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.platform }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.platform }}-cargo-release-
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: noise-gator-${{ matrix.platform }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+
+  create-release:
+    needs: [ tag, release-build ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.tag.outputs.version }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            artifacts/noise-gator-windows/noise-gator.exe \
+            artifacts/noise-gator-macos/noise-gator
