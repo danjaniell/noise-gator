@@ -70,3 +70,87 @@ impl Processor for Denoiser {
         self.out_buf.fill(0.0);
     }
 }
+
+/// Two-pass RNNoise denoiser for stronger suppression.
+///
+/// Runs audio through two independent RNNoise instances sequentially.
+/// The second pass catches residual noise that the first pass left behind,
+/// providing significantly better suppression at the cost of ~2x CPU.
+pub struct DualPassDenoiser {
+    pass1: Denoiser,
+    pass2: Denoiser,
+}
+
+impl DualPassDenoiser {
+    pub fn new() -> Self {
+        Self {
+            pass1: Denoiser::new(),
+            pass2: Denoiser::new(),
+        }
+    }
+}
+
+// SAFETY: Same rationale as Denoiser — exclusively owned by a single audio
+// callback closure.
+unsafe impl Send for DualPassDenoiser {}
+
+impl Processor for DualPassDenoiser {
+    fn process(&mut self, samples: &mut [f32]) -> ProcessResult {
+        // First pass: primary denoise + VAD extraction
+        let result = self.pass1.process(samples);
+        // Second pass: clean up residual noise
+        self.pass2.process(samples);
+        // Return VAD from first pass (most accurate on raw signal)
+        result
+    }
+
+    fn reset(&mut self) {
+        self.pass1.reset();
+        self.pass2.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dual_pass_processes_without_panic() {
+        let mut dp = DualPassDenoiser::new();
+        let mut samples = [0.1f32; FRAME_SIZE];
+        let result = dp.process(&mut samples);
+        assert!(result.vad.is_some(), "VAD should come from first pass");
+    }
+
+    #[test]
+    fn dual_pass_vad_comes_from_first_pass() {
+        let mut dp = DualPassDenoiser::new();
+        // Feed a frame with signal — first pass should produce non-zero VAD
+        let mut samples = [0.0f32; FRAME_SIZE];
+        for (i, s) in samples.iter_mut().enumerate() {
+            *s = (i as f32 * 0.1).sin() * 0.5;
+        }
+        let result = dp.process(&mut samples);
+        assert!(result.vad.is_some());
+    }
+
+    #[test]
+    fn dual_pass_output_differs_from_single_pass() {
+        let mut single = Denoiser::new();
+        let mut dual = DualPassDenoiser::new();
+
+        let mut input = [0.0f32; FRAME_SIZE];
+        for (i, s) in input.iter_mut().enumerate() {
+            *s = (i as f32 * 0.1).sin() * 0.3;
+        }
+
+        let mut single_out = input;
+        let mut dual_out = input;
+        single.process(&mut single_out);
+        dual.process(&mut dual_out);
+
+        // They should produce different output (dual-pass applies more suppression)
+        let differs = single_out.iter().zip(&dual_out).any(|(a, b)| (a - b).abs() > 1e-10);
+        assert!(differs, "Dual-pass should differ from single-pass");
+    }
+}

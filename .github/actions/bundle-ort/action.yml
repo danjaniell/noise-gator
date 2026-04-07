@@ -1,0 +1,61 @@
+name: Bundle ONNX Runtime
+description: Download latest ONNX Runtime and create release zip with binary
+
+inputs:
+  target:
+    required: true
+    description: Rust target triple
+  artifact:
+    required: true
+    description: Binary filename (e.g., noise-gator.exe)
+  ort_platform:
+    required: true
+    description: ORT platform suffix (e.g., win-x64)
+  ort_ext:
+    required: true
+    description: Archive extension (zip or tgz)
+  ort_lib:
+    required: true
+    description: ORT shared library filename
+  platform:
+    required: true
+    description: Platform name (windows or macos)
+  zip_name:
+    required: true
+    description: Output zip filename
+
+runs:
+  using: composite
+  steps:
+    - name: Download ONNX Runtime (latest)
+      shell: bash
+      run: |
+        mkdir -p ort-dist ort-extract
+        ORT_TAG=$(curl -sL https://api.github.com/repos/microsoft/onnxruntime/releases/latest | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+        ORT_VER="${ORT_TAG#v}"
+        echo "ONNX Runtime version: $ORT_VER"
+        URL="https://github.com/microsoft/onnxruntime/releases/download/${ORT_TAG}/onnxruntime-${{ inputs.ort_platform }}-${ORT_VER}.${{ inputs.ort_ext }}"
+        echo "Downloading: $URL"
+        curl -sL "$URL" -o "ort-archive.${{ inputs.ort_ext }}"
+        if [[ "${{ inputs.ort_ext }}" == "zip" ]]; then
+          unzip -q "ort-archive.${{ inputs.ort_ext }}" -d ort-extract
+        else
+          tar xzf "ort-archive.${{ inputs.ort_ext }}" -C ort-extract
+        fi
+        find ort-extract -name "${{ inputs.ort_lib }}" -exec cp {} ort-dist/ \;
+        ls -lh ort-dist/
+
+    - name: Create release zip
+      shell: bash
+      run: |
+        mkdir -p release-package
+        cp target/${{ inputs.target }}/release/${{ inputs.artifact }} release-package/
+        cp ort-dist/${{ inputs.ort_lib }} release-package/
+        cd release-package
+        if [[ "${{ inputs.platform }}" == "windows" ]]; then
+          7z a -tzip ../${{ inputs.zip_name }} *
+        else
+          zip ../${{ inputs.zip_name }} *
+        fi
+        cd ..
+        ls -lh ${{ inputs.zip_name }}

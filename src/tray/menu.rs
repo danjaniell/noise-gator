@@ -15,10 +15,13 @@ pub struct MenuState {
     pub eq_enabled_id: muda::MenuId,
     pub settings_id: muda::MenuId,
     pub quit_id: muda::MenuId,
-    pub input_ids: Vec<(muda::MenuId, String)>,
-    pub output_ids: Vec<(muda::MenuId, String)>,
+    pub input_items: Vec<(CheckMenuItem, String)>,
+    pub output_items: Vec<(CheckMenuItem, String)>,
     pub engine_rnnoise_id: muda::MenuId,
     pub engine_deepfilter_id: muda::MenuId,
+    // Keep CheckMenuItem refs to control checked state programmatically
+    pub engine_rnnoise_item: CheckMenuItem,
+    pub engine_deepfilter_item: CheckMenuItem,
 }
 
 pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState) {
@@ -34,15 +37,26 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
 
     // ── Input device submenu ────────────────────────────────────────
     let input_sub = Submenu::new("Input Device", true);
-    let mut input_ids = Vec::new();
+    let mut input_items = Vec::new();
+    // "System Default" option — uses whatever the OS default input is
+    let sys_default_input = CheckMenuItem::new(
+        "System Default",
+        true,
+        config.input_device.is_none(),
+        None,
+    );
+    input_items.push((sys_default_input.clone(), String::new()));
+    let _ = input_sub.append(&sys_default_input);
+    let _ = input_sub.append(&PredefinedMenuItem::separator());
+
     if let Ok(devices) = device::list_input_devices() {
         for dev in &devices {
             let is_selected = config
                 .input_device
                 .as_deref()
-                .map_or(dev.is_default, |s| s == dev.name);
+                .is_some_and(|s| s == dev.name);
             let item = CheckMenuItem::new(&dev.display_name(), true, is_selected, None);
-            input_ids.push((item.id().clone(), dev.name.clone()));
+            input_items.push((item.clone(), dev.name.clone()));
             let _ = input_sub.append(&item);
         }
     }
@@ -50,14 +64,14 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
 
     // ── Output device submenu ───────────────────────────────────────
     let output_sub = Submenu::new("Monitor Output", true);
-    let mut output_ids = Vec::new();
+    let mut output_items = Vec::new();
     let none_item = CheckMenuItem::new(
         "None (no monitoring)",
         true,
         config.output_device.is_none(),
         None,
     );
-    output_ids.push((none_item.id().clone(), String::new()));
+    output_items.push((none_item.clone(), String::new()));
     let _ = output_sub.append(&none_item);
 
     if let Ok(devices) = device::list_output_devices() {
@@ -67,7 +81,7 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
                 .as_deref()
                 .is_some_and(|s| s == dev.name);
             let item = CheckMenuItem::new(&dev.name, true, is_selected, None);
-            output_ids.push((item.id().clone(), dev.name.clone()));
+            output_items.push((item.clone(), dev.name.clone()));
             let _ = output_sub.append(&item);
         }
     }
@@ -100,18 +114,18 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
     let engine_sub = Submenu::new("Engine", true);
 
     let is_rnnoise = config.engine == DenoiseEngine::RNNoise;
-    let rnnoise_item = CheckMenuItem::new("RNNoise (default)", true, is_rnnoise, None);
-    let engine_rnnoise_id = rnnoise_item.id().clone();
-    let _ = engine_sub.append(&rnnoise_item);
+    let engine_rnnoise_item = CheckMenuItem::new("RNNoise (lightweight)", true, is_rnnoise, None);
+    let engine_rnnoise_id = engine_rnnoise_item.id().clone();
+    let _ = engine_sub.append(&engine_rnnoise_item);
 
     let df_label = if crate::models::is_deepfilter_available() {
         "DeepFilterNet"
     } else {
         "DeepFilterNet (Download ~8MB)"
     };
-    let df_item = CheckMenuItem::new(df_label, true, !is_rnnoise, None);
-    let engine_deepfilter_id = df_item.id().clone();
-    let _ = engine_sub.append(&df_item);
+    let engine_deepfilter_item = CheckMenuItem::new(df_label, true, !is_rnnoise, None);
+    let engine_deepfilter_id = engine_deepfilter_item.id().clone();
+    let _ = engine_sub.append(&engine_deepfilter_item);
 
     let _ = menu.append(&engine_sub);
 
@@ -133,13 +147,41 @@ pub fn build_menu(config: &Config, pipeline: &Arc<Pipeline>) -> (Menu, MenuState
         eq_enabled_id,
         settings_id,
         quit_id,
-        input_ids,
-        output_ids,
+        input_items,
+        output_items,
         engine_rnnoise_id,
         engine_deepfilter_id,
+        engine_rnnoise_item,
+        engine_deepfilter_item,
     };
 
     (menu, state)
+}
+
+/// Set engine checkmarks — ensures exactly one is checked.
+fn set_engine_checked(state: &MenuState, engine: DenoiseEngine) {
+    let is_rnnoise = engine == DenoiseEngine::RNNoise;
+    state.engine_rnnoise_item.set_checked(is_rnnoise);
+    state.engine_deepfilter_item.set_checked(!is_rnnoise);
+}
+
+/// Revert to RNNoise: update config, checkmarks, and restart pipeline.
+fn revert_to_rnnoise(
+    state: &MenuState,
+    pipeline: &Arc<Pipeline>,
+    config: &mut Config,
+) {
+    config.engine = DenoiseEngine::RNNoise;
+    pipeline
+        .settings
+        .engine
+        .store(DenoiseEngine::RNNoise.as_u8(), Ordering::Relaxed);
+    set_engine_checked(state, DenoiseEngine::RNNoise);
+    let _ = pipeline.start(
+        config.input_device.as_deref(),
+        config.output_device.as_deref(),
+        config.virtual_device.as_deref(),
+    );
 }
 
 pub fn handle_event(
@@ -206,17 +248,11 @@ pub fn handle_event(
     // ── Engine selection ────────────────────────────────────────────
     if *id == state.engine_rnnoise_id {
         if config.engine != DenoiseEngine::RNNoise {
-            config.engine = DenoiseEngine::RNNoise;
-            pipeline.settings.engine.store(0, Ordering::Relaxed);
             tracing::info!("Switching to RNNoise");
             pipeline.stop();
-            if let Err(e) = pipeline.start(
-                config.input_device.as_deref(),
-                config.output_device.as_deref(),
-                config.virtual_device.as_deref(),
-            ) {
-                tracing::error!("Failed to restart pipeline: {e}");
-            }
+            revert_to_rnnoise(state, pipeline, config);
+        } else {
+            set_engine_checked(state, DenoiseEngine::RNNoise);
         }
         return;
     }
@@ -226,32 +262,39 @@ pub fn handle_event(
             tracing::info!("Switching to DeepFilterNet...");
             pipeline.stop();
 
-            // Download model if needed (blocking with user notification)
-            if !crate::models::is_deepfilter_available() {
+            // Initialize ONNX Runtime + download model if needed
+            if !crate::models::is_ort_available() || !crate::models::is_deepfilter_available() {
                 show_message(
                     "Noise Gator",
-                    "Downloading DeepFilterNet model (~8MB).\nThis may take a moment.",
+                    "Downloading DeepFilterNet dependencies.\nThis may take a moment.",
                 );
+            }
+
+            if let Err(e) = crate::models::init_ort() {
+                tracing::error!("ONNX Runtime init failed: {e}");
+                show_message("Noise Gator", &format!("ONNX Runtime setup failed: {e}"));
+                revert_to_rnnoise(state, pipeline, config);
+                return;
+            }
+
+            if !crate::models::is_deepfilter_available() {
                 match crate::models::ensure_deepfilter_model() {
-                    Ok(_) => {
-                        tracing::info!("DeepFilterNet model installed.");
-                    }
+                    Ok(_) => tracing::info!("DeepFilterNet model installed."),
                     Err(e) => {
                         tracing::error!("Model download failed: {e}");
                         show_message("Noise Gator", &format!("Download failed: {e}"));
-                        // Restart with RNNoise
-                        let _ = pipeline.start(
-                            config.input_device.as_deref(),
-                            config.output_device.as_deref(),
-                            config.virtual_device.as_deref(),
-                        );
+                        revert_to_rnnoise(state, pipeline, config);
                         return;
                     }
                 }
             }
 
             config.engine = DenoiseEngine::DeepFilter;
-            pipeline.settings.engine.store(1, Ordering::Relaxed);
+            pipeline
+                .settings
+                .engine
+                .store(DenoiseEngine::DeepFilter.as_u8(), Ordering::Relaxed);
+            set_engine_checked(state, DenoiseEngine::DeepFilter);
 
             if let Err(e) = pipeline.start(
                 config.input_device.as_deref(),
@@ -259,28 +302,35 @@ pub fn handle_event(
                 config.virtual_device.as_deref(),
             ) {
                 tracing::error!("Failed to restart with DeepFilter: {e}");
-                // Fall back to RNNoise
-                config.engine = DenoiseEngine::RNNoise;
-                pipeline.settings.engine.store(0, Ordering::Relaxed);
-                let _ = pipeline.start(
-                    config.input_device.as_deref(),
-                    config.output_device.as_deref(),
-                    config.virtual_device.as_deref(),
-                );
+                revert_to_rnnoise(state, pipeline, config);
             }
+        } else {
+            set_engine_checked(state, DenoiseEngine::DeepFilter);
         }
         return;
     }
 
     // ── Input device selection ──────────────────────────────────────
-    for (item_id, device_name) in &state.input_ids {
-        if id == item_id {
-            config.input_device = Some(device_name.clone());
-            tracing::info!("Input device: {device_name}");
+    for (item, device_name) in &state.input_items {
+        if *id == *item.id() {
+            // Empty name = "System Default" → config None
+            config.input_device = if device_name.is_empty() {
+                None
+            } else {
+                Some(device_name.clone())
+            };
+            // Enforce mutual exclusivity: uncheck all, check selected
+            for (other, _) in &state.input_items {
+                other.set_checked(*other.id() == *item.id());
+            }
+            tracing::info!(
+                "Input device: {}",
+                config.input_device.as_deref().unwrap_or("system default")
+            );
             if pipeline.is_running() {
                 pipeline.stop();
                 if let Err(e) = pipeline.start(
-                    Some(device_name.as_str()),
+                    config.input_device.as_deref(),
                     config.output_device.as_deref(),
                     config.virtual_device.as_deref(),
                 ) {
@@ -292,13 +342,17 @@ pub fn handle_event(
     }
 
     // ── Output device selection ─────────────────────────────────────
-    for (item_id, device_name) in &state.output_ids {
-        if id == item_id {
+    for (item, device_name) in &state.output_items {
+        if *id == *item.id() {
             config.output_device = if device_name.is_empty() {
                 None
             } else {
                 Some(device_name.clone())
             };
+            // Enforce mutual exclusivity: uncheck all, check selected
+            for (other, _) in &state.output_items {
+                other.set_checked(*other.id() == *item.id());
+            }
             tracing::info!(
                 "Monitor output: {}",
                 config.output_device.as_deref().unwrap_or("none")

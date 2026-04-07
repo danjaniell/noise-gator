@@ -38,7 +38,11 @@ struct UiState {
 }
 
 impl UiState {
-    fn from_settings(settings: &RuntimeSettings) -> Self {
+    fn from_settings(
+        settings: &RuntimeSettings,
+        input_device: Option<&str>,
+        output_device: Option<&str>,
+    ) -> Self {
         let suppression = f32::from_bits(settings.suppression_level.load(Ordering::Relaxed));
         let threshold = f32::from_bits(settings.gate_threshold.load(Ordering::Relaxed));
         let eq_bass = settings.eq_bass_db10.load(Ordering::Relaxed) as f32 / 10.0;
@@ -68,8 +72,8 @@ impl UiState {
             output_meter: 0.0,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
-            selected_input: String::new(),
-            selected_output: String::new(),
+            selected_input: input_device.unwrap_or_default().to_string(),
+            selected_output: output_device.unwrap_or_default().to_string(),
         }
     }
 }
@@ -85,8 +89,13 @@ pub struct SettingsApp {
 }
 
 impl SettingsApp {
-    pub fn new(settings: Arc<RuntimeSettings>, pipeline: Arc<Pipeline>) -> Self {
-        let ui = UiState::from_settings(&settings);
+    pub fn new(
+        settings: Arc<RuntimeSettings>,
+        pipeline: Arc<Pipeline>,
+        input_device: Option<&str>,
+        output_device: Option<&str>,
+    ) -> Self {
+        let ui = UiState::from_settings(&settings, input_device, output_device);
         Self {
             settings,
             pipeline,
@@ -186,17 +195,31 @@ impl SettingsApp {
                 let mut input_changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Input:");
-                    let current_display = self
-                        .ui
-                        .input_devices
-                        .iter()
-                        .find(|(name, _)| *name == self.ui.selected_input)
-                        .map_or("(default)", |(_, display)| display.as_str());
+                    let current_display = if self.ui.selected_input.is_empty() {
+                        "System Default"
+                    } else {
+                        self.ui
+                            .input_devices
+                            .iter()
+                            .find(|(name, _)| *name == self.ui.selected_input)
+                            .map_or("(unknown)", |(_, display)| display.as_str())
+                    };
 
                     egui::ComboBox::from_id_salt("input_device")
                         .selected_text(current_display)
                         .width(250.0)
                         .show_ui(ui, |ui| {
+                            // "System Default" option — follows OS default device
+                            if ui
+                                .selectable_value(
+                                    &mut self.ui.selected_input,
+                                    String::new(),
+                                    "System Default",
+                                )
+                                .changed()
+                            {
+                                input_changed = true;
+                            }
                             for (name, display) in &self.ui.input_devices {
                                 if ui
                                     .selectable_value(

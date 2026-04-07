@@ -171,7 +171,9 @@ fn find_device(host: &Host, name: Option<&str>, is_input: bool) -> Result<Device
     }
 }
 
-/// Pick the best F32 config for a device, preferring 48 kHz and low channel count.
+/// Pick the best audio config for a device, preferring F32 then I16, targeting 48 kHz
+/// and low channel count. Returns the actual supported format — caller must handle
+/// sample conversion if the format is not F32.
 pub fn best_f32_config(device: &Device, is_input: bool) -> Result<SupportedStreamConfig> {
     let configs: Vec<_> = if is_input {
         device.supported_input_configs()?.collect()
@@ -179,24 +181,32 @@ pub fn best_f32_config(device: &Device, is_input: bool) -> Result<SupportedStrea
         device.supported_output_configs()?.collect()
     };
 
-    let f32_cfg = configs
+    // Score a config: prefer F32 > I16 > others, then 48kHz, then low channel count.
+    let score = |c: &cpal::SupportedStreamConfigRange| -> i64 {
+        let fmt_score: i64 = match c.sample_format() {
+            SampleFormat::F32 => 0,
+            SampleFormat::I16 => 1_000_000,
+            _ => 2_000_000,
+        };
+        let rate_diff = (c.max_sample_rate() as i64 - 48_000).abs();
+        let ch_score = if c.channels() <= 2 {
+            0
+        } else {
+            c.channels() as i64 * 1000
+        };
+        fmt_score + rate_diff + ch_score
+    };
+
+    let best = configs
         .iter()
-        .filter(|c| c.sample_format() == SampleFormat::F32)
-        .min_by_key(|c| {
-            let rate_diff = (c.max_sample_rate() as i64 - 48_000).abs();
-            let ch_score = if c.channels() <= 2 {
-                0
-            } else {
-                c.channels() as i64
-            };
-            rate_diff + ch_score * 1000
-        })
+        .filter(|c| matches!(c.sample_format(), SampleFormat::F32 | SampleFormat::I16))
+        .min_by_key(|c| score(c))
         .map(|c| {
             let rate = c.max_sample_rate().min(48_000).max(c.min_sample_rate());
             (*c).with_sample_rate(rate)
         });
 
-    if let Some(cfg) = f32_cfg {
+    if let Some(cfg) = best {
         return Ok(cfg);
     }
 

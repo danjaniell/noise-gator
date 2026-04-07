@@ -21,12 +21,29 @@ jobs:
         with:
           toolchain: "1.85"
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
+        id: sccache
+
+      - name: Enable sccache wrapper
+        if: steps.sccache.outcome == 'success'
+        shell: bash
+        run: |
+          export SCCACHE_GHA_ENABLED=true
+          if sccache --start-server 2>/dev/null && sccache --show-stats >/dev/null 2>&1; then
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache server failed to start — building without cache"
+            sccache --stop-server 2>/dev/null || true
+          fi
+
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: windows-cargo-
 
@@ -52,12 +69,29 @@ jobs:
         with:
           toolchain: "1.85"
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
+        id: sccache
+
+      - name: Enable sccache wrapper
+        if: steps.sccache.outcome == 'success'
+        shell: bash
+        run: |
+          export SCCACHE_GHA_ENABLED=true
+          if sccache --start-server 2>/dev/null && sccache --show-stats >/dev/null 2>&1; then
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache server failed to start — building without cache"
+            sccache --stop-server 2>/dev/null || true
+          fi
+
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-cargo-
 
@@ -155,11 +189,19 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: noise-gator.exe
+            ort_platform: win-x64
+            ort_ext: zip
+            ort_lib: onnxruntime.dll
             platform: windows
+            zip_name: noise-gator-windows.zip
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: noise-gator
+            ort_platform: osx-x86_64
+            ort_ext: tgz
+            ort_lib: libonnxruntime.dylib
             platform: macos
+            zip_name: noise-gator-macos.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -174,23 +216,51 @@ jobs:
           toolchain: "1.85"
           targets: ${{ matrix.target }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
+        id: sccache
+
+      - name: Enable sccache wrapper
+        if: steps.sccache.outcome == 'success'
+        shell: bash
+        run: |
+          export SCCACHE_GHA_ENABLED=true
+          if sccache --start-server 2>/dev/null && sccache --show-stats >/dev/null 2>&1; then
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache server failed to start — building without cache"
+            sccache --stop-server 2>/dev/null || true
+          fi
+
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ matrix.platform }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.platform }}-cargo-release-
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }} --verbose
 
+      - name: Bundle ONNX Runtime + create release zip
+        uses: ./.github/actions/bundle-ort
+        with:
+          target: ${{ matrix.target }}
+          artifact: ${{ matrix.artifact }}
+          ort_platform: ${{ matrix.ort_platform }}
+          ort_ext: ${{ matrix.ort_ext }}
+          ort_lib: ${{ matrix.ort_lib }}
+          platform: ${{ matrix.platform }}
+          zip_name: ${{ matrix.zip_name }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: noise-gator-${{ matrix.platform }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          path: ${{ matrix.zip_name }}
 
   create-release:
     needs: [ tag, release-build ]
@@ -213,5 +283,5 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            artifacts/noise-gator-windows/noise-gator.exe \
-            artifacts/noise-gator-macos/noise-gator
+            artifacts/noise-gator-windows/noise-gator-windows.zip \
+            artifacts/noise-gator-macos/noise-gator-macos.zip

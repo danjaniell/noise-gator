@@ -1,4 +1,4 @@
-//! DeepFilterNet processor — wraps 3 ONNX models via tract-onnx.
+//! DeepFilterNet processor — wraps 3 ONNX models via ort (ONNX Runtime).
 //!
 //! Feature-gated behind `deepfilter`. When the feature is disabled, this module
 //! provides a stub that returns an error on construction.
@@ -12,8 +12,22 @@ mod inner {
 
     use anyhow::{Result, anyhow};
     use ndarray::Array4;
+    use ort::session::Session;
+    use ort::value::TensorRef;
     use rustfft::{FftPlanner, num_complex::Complex32};
-    use tract_onnx::prelude::*;
+
+    /// Helper to extract a named output as an owned Vec<f32> with shape info.
+    fn extract_output(
+        outputs: &ort::session::SessionOutputs<'_>,
+        name: &str,
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        let value = outputs
+            .get(name)
+            .ok_or_else(|| anyhow!("Model missing expected output '{name}'"))?;
+        let (shape, data) = value.try_extract_tensor::<f32>()?;
+        let shape_usize: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+        Ok((shape_usize, data.to_vec()))
+    }
 
     use super::{ProcessResult, Processor};
 
@@ -26,21 +40,20 @@ mod inner {
     const NB_DF: usize = 96;
     const DF_ORDER: usize = 5;
 
+    /// Maximum consecutive inference errors before disabling DeepFilter.
+    const MAX_ERRORS: usize = 10;
+
     /// ERB band edges for 32 bands at 48kHz with FFT size 960.
-    /// Each band spans a range of frequency bins. Precomputed from the
-    /// DeepFilterNet erb_fb() function with min_nb_erb_freqs=2.
     static ERB_WIDTHS: [usize; NB_ERB] = [
-        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20, 23,
-        26, 30, 35, 39,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
+        23, 26, 30, 35, 39,
     ];
 
-    type TractModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
-
     pub struct DeepFilterProcessor {
-        // ONNX models
-        encoder: TractModel,
-        erb_decoder: TractModel,
-        df_decoder: TractModel,
+        // ONNX Runtime sessions
+        encoder: Session,
+        erb_decoder: Session,
+        df_decoder: Session,
         // FFT
         fft_forward: Arc<dyn rustfft::Fft<f32>>,
         fft_inverse: Arc<dyn rustfft::Fft<f32>>,
@@ -48,23 +61,46 @@ mod inner {
         analysis_window: Vec<f32>,
         synthesis_window: Vec<f32>,
         // State buffers
-        input_buf: Vec<f32>,  // ring buffer for overlap
-        output_buf: Vec<f32>, // overlap-add output
+        input_buf: Vec<f32>,
+        output_buf: Vec<f32>,
+        fft_buf: Vec<Complex32>,
+        ifft_buf: Vec<Complex32>,
         fft_scratch: Vec<Complex32>,
         spectrum: Vec<Complex32>,
         // Rolling DF buffer: last DF_ORDER frames of first NB_DF bins
         df_buf: Vec<Vec<Complex32>>,
         // Normalization state
-        erb_norm_state: f32,       // running mean for ERB normalization
-        spec_norm_state: Vec<f32>, // running norm per DF bin
-        alpha: f32,                // smoothing coefficient
+        erb_norm_state: f32,
+        spec_norm_state: Vec<f32>,
+        alpha: f32,
         // Position tracking
         frame_count: usize,
+        // Error tracking
+        error_count: usize,
     }
 
-    // SAFETY: Same rationale as Denoiser — exclusively owned by a single audio
-    // callback closure, never shared across threads.
+    // SAFETY: Exclusively owned by a single audio callback closure.
     unsafe impl Send for DeepFilterProcessor {}
+
+    /// Encoder output tensors as owned (shape, data) pairs for passing to decoders.
+    struct EncoderOutput {
+        e0: (Vec<usize>, Vec<f32>),
+        e1: (Vec<usize>, Vec<f32>),
+        e2: (Vec<usize>, Vec<f32>),
+        e3: (Vec<usize>, Vec<f32>),
+        emb: (Vec<usize>, Vec<f32>),
+        c0: (Vec<usize>, Vec<f32>),
+    }
+
+    impl EncoderOutput {
+        /// Create a TensorRef from one of the stored outputs.
+        fn tensor_ref(field: &(Vec<usize>, Vec<f32>)) -> Result<TensorRef<'_, f32>> {
+            Ok(TensorRef::from_array_view(
+                ndarray::ArrayViewD::from_shape(field.0.as_slice(), field.1.as_slice())
+                    .map_err(|e| anyhow!("Shape mismatch: {e}"))?,
+            )?)
+        }
+    }
 
     impl DeepFilterProcessor {
         pub fn from_model_dir(model_dir: &Path) -> Result<Self> {
@@ -79,36 +115,43 @@ mod inner {
                 ));
             }
 
-            // Load models with tract — optimize for inference
-            let encoder = tract_onnx::onnx()
-                .model_for_path(&enc_path)?
-                .into_optimized()?
-                .into_runnable()?;
+            use ort::session::builder::GraphOptimizationLevel;
 
-            let erb_decoder = tract_onnx::onnx()
-                .model_for_path(&erb_dec_path)?
-                .into_optimized()?
-                .into_runnable()?;
+            let encoder = Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(1)?
+                .commit_from_file(&enc_path)?;
 
-            let df_decoder = tract_onnx::onnx()
-                .model_for_path(&df_dec_path)?
-                .into_optimized()?
-                .into_runnable()?;
+            let erb_decoder = Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(1)?
+                .commit_from_file(&erb_dec_path)?;
+
+            let df_decoder = Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(1)?
+                .commit_from_file(&df_dec_path)?;
+
+            // Log model info
+            tracing::info!(
+                "DeepFilter encoder: {} inputs, {} outputs",
+                encoder.inputs.len(),
+                encoder.outputs.len()
+            );
 
             // FFT setup
             let mut planner = FftPlanner::<f32>::new();
             let fft_forward = planner.plan_fft_forward(FFT_SIZE);
             let fft_inverse = planner.plan_fft_inverse(FFT_SIZE);
 
-            // Vorbis window: w(n) = sin(pi/2 * sin^2(pi * n / N))
+            // sqrt-Hann window — matches DeepFilterNet training STFT.
+            // analysis * synthesis must satisfy COLA for perfect reconstruction.
             let analysis_window: Vec<f32> = (0..FFT_SIZE)
                 .map(|n| {
-                    let x = std::f32::consts::PI * n as f32 / FFT_SIZE as f32;
-                    (std::f32::consts::FRAC_PI_2 * x.sin().powi(2)).sin()
+                    let hann = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * n as f32 / FFT_SIZE as f32).cos());
+                    hann.sqrt()
                 })
                 .collect();
-
-            // Synthesis window (same shape, normalized for overlap-add reconstruction)
             let synthesis_window = analysis_window.clone();
 
             let alpha = (-(HOP_SIZE as f64) / (SR as f64 * 1.0)).exp() as f32;
@@ -123,6 +166,8 @@ mod inner {
                 synthesis_window,
                 input_buf: vec![0.0; FFT_SIZE],
                 output_buf: vec![0.0; FFT_SIZE],
+                fft_buf: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
+                ifft_buf: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
                 fft_scratch: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
                 spectrum: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
                 df_buf: vec![vec![Complex32::new(0.0, 0.0); NB_DF]; DF_ORDER],
@@ -130,74 +175,77 @@ mod inner {
                 spec_norm_state: vec![0.0; NB_DF],
                 alpha,
                 frame_count: 0,
+                error_count: 0,
             })
         }
 
+        pub fn is_failed(&self) -> bool {
+            self.error_count >= MAX_ERRORS
+        }
+
         fn process_frame(&mut self, frame: &mut [f32]) {
-            // Shift input buffer and insert new samples
             self.input_buf.copy_within(HOP_SIZE.., 0);
             self.input_buf[FFT_SIZE - HOP_SIZE..].copy_from_slice(frame);
 
-            // Apply analysis window and FFT
-            let mut fft_buf: Vec<Complex32> = self
-                .input_buf
-                .iter()
-                .zip(&self.analysis_window)
-                .map(|(&s, &w)| Complex32::new(s * w, 0.0))
-                .collect();
+            for (buf, (&s, &w)) in self
+                .fft_buf
+                .iter_mut()
+                .zip(self.input_buf.iter().zip(&self.analysis_window))
+            {
+                *buf = Complex32::new(s * w, 0.0);
+            }
 
             self.fft_forward
-                .process_with_scratch(&mut fft_buf, &mut self.fft_scratch);
+                .process_with_scratch(&mut self.fft_buf, &mut self.fft_scratch);
 
-            // Store spectrum (only positive frequencies)
-            self.spectrum[..FREQ_SIZE].copy_from_slice(&fft_buf[..FREQ_SIZE]);
+            self.spectrum[..FREQ_SIZE].copy_from_slice(&self.fft_buf[..FREQ_SIZE]);
 
-            // ── Feature extraction ──────────────────────────────────────
             let erb_feat = self.compute_erb_features();
             let spec_feat = self.compute_spec_features();
 
-            // ── Encoder ─────────────────────────────────────────────────
             let enc_result = match self.run_encoder(&erb_feat, &spec_feat) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("Encoder inference failed: {e}");
                     frame.copy_from_slice(&self.input_buf[FFT_SIZE - HOP_SIZE..]);
+                    self.error_count += 1;
                     return;
                 }
             };
 
-            // ── ERB Decoder → gain mask ─────────────────────────────────
             let erb_gains = match self.run_erb_decoder(&enc_result) {
                 Ok(g) => g,
                 Err(e) => {
                     tracing::error!("ERB decoder failed: {e}");
                     frame.copy_from_slice(&self.input_buf[FFT_SIZE - HOP_SIZE..]);
+                    self.error_count += 1;
                     return;
                 }
             };
 
-            // Apply ERB gains to spectrum
+            // Save original noisy spectrum for DF buffer BEFORE ERB gains modify it.
+            // Deep filtering uses learned filters on the raw noisy signal, not
+            // the ERB-enhanced one.
+            self.df_buf.rotate_left(1);
+            let last = self.df_buf.last_mut().unwrap();
+            last[..NB_DF].copy_from_slice(&self.spectrum[..NB_DF]);
+
             self.apply_erb_gains(&erb_gains);
 
-            // ── DF Decoder → deep filtering coefficients ────────────────
             let df_coefs = match self.run_df_decoder(&enc_result) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("DF decoder failed: {e}");
-                    // Continue with ERB-only enhancement
                     tracing::warn!("Falling back to ERB-only enhancement");
-                    self.apply_df_fallback();
                     self.synthesize(frame);
                     return;
                 }
             };
 
-            // Apply deep filtering to first NB_DF frequency bins
             self.apply_deep_filtering(&df_coefs);
-
-            // ── Inverse STFT ────────────────────────────────────────────
             self.synthesize(frame);
             self.frame_count += 1;
+            self.error_count = 0;
         }
 
         fn compute_erb_features(&mut self) -> [f32; NB_ERB] {
@@ -214,12 +262,10 @@ mod inner {
                 bin += width;
             }
 
-            // Log + normalization
             for v in &mut erb {
                 *v = (*v + 1e-10).log10() * 10.0;
             }
 
-            // Exponential mean normalization
             let mean: f32 = erb.iter().sum::<f32>() / NB_ERB as f32;
             self.erb_norm_state = self.alpha * self.erb_norm_state + (1.0 - self.alpha) * mean;
             for v in &mut erb {
@@ -229,70 +275,72 @@ mod inner {
             erb
         }
 
-        fn compute_spec_features(&mut self) -> Vec<[f32; 2]> {
-            let mut features = Vec::with_capacity(NB_DF);
+        fn compute_spec_features(&mut self) -> [[f32; 2]; NB_DF] {
+            let mut features = [[0.0f32; 2]; NB_DF];
             for i in 0..NB_DF {
                 let c = self.spectrum[i];
                 let norm_sqr = c.norm_sqr();
-
-                // Update running normalization
                 self.spec_norm_state[i] =
                     self.alpha * self.spec_norm_state[i] + (1.0 - self.alpha) * norm_sqr;
-
                 let norm = (self.spec_norm_state[i] + 1e-10).sqrt();
-                features.push([c.re / norm, c.im / norm]);
+                features[i] = [c.re / norm, c.im / norm];
             }
             features
         }
 
-        fn run_encoder(&self, erb: &[f32; NB_ERB], spec: &[[f32; 2]]) -> Result<EncoderOutput> {
-            // feat_erb: [1, 1, 1, 32]
-            let erb_tensor: Tensor =
-                Array4::from_shape_fn((1, 1, 1, NB_ERB), |(_, _, _, i)| erb[i]).into();
+        fn run_encoder(
+            &mut self,
+            erb: &[f32; NB_ERB],
+            spec: &[[f32; 2]; NB_DF],
+        ) -> Result<EncoderOutput> {
+            let erb_array = Array4::from_shape_fn((1, 1, 1, NB_ERB), |(_, _, _, i)| erb[i]);
+            let spec_array =
+                Array4::from_shape_fn((1, 2, 1, NB_DF), |(_, ch, _, i)| spec[i][ch]);
 
-            // feat_spec: [1, 2, 1, 96]
-            let spec_tensor: Tensor =
-                Array4::from_shape_fn((1, 2, 1, NB_DF), |(_, ch, _, i)| spec[i][ch]).into();
+            let erb_ref = TensorRef::from_array_view(erb_array.view())?;
+            let spec_ref = TensorRef::from_array_view(spec_array.view())?;
 
-            let result = self
-                .encoder
-                .run(tvec![erb_tensor.into(), spec_tensor.into(),])?;
+            let outputs = self.encoder.run(ort::inputs![
+                "feat_erb" => erb_ref,
+                "feat_spec" => spec_ref
+            ])?;
 
-            // Outputs: e0, e1, e2, e3, emb, c0, lsnr
             Ok(EncoderOutput {
-                e0: result[0].clone(),
-                e1: result[1].clone(),
-                e2: result[2].clone(),
-                e3: result[3].clone(),
-                emb: result[4].clone(),
-                c0: result[5].clone(),
-                _lsnr: result[6].clone(),
+                e0: extract_output(&outputs, "e0")?,
+                e1: extract_output(&outputs, "e1")?,
+                e2: extract_output(&outputs, "e2")?,
+                e3: extract_output(&outputs, "e3")?,
+                emb: extract_output(&outputs, "emb")?,
+                c0: extract_output(&outputs, "c0")?,
             })
         }
 
-        fn run_erb_decoder(&self, enc: &EncoderOutput) -> Result<Vec<f32>> {
-            // Inputs: emb, e3, e2, e1, e0
-            let result = self.erb_decoder.run(tvec![
-                enc.emb.clone(),
-                enc.e3.clone(),
-                enc.e2.clone(),
-                enc.e1.clone(),
-                enc.e0.clone(),
+        fn run_erb_decoder(&mut self, enc: &EncoderOutput) -> Result<Vec<f32>> {
+            let outputs = self.erb_decoder.run(ort::inputs![
+                "emb" => EncoderOutput::tensor_ref(&enc.emb)?,
+                "e3" => EncoderOutput::tensor_ref(&enc.e3)?,
+                "e2" => EncoderOutput::tensor_ref(&enc.e2)?,
+                "e1" => EncoderOutput::tensor_ref(&enc.e1)?,
+                "e0" => EncoderOutput::tensor_ref(&enc.e0)?
             ])?;
 
-            // Output: gain mask [1, 1, 1, 32]
-            let gains: Vec<f32> = result[0].to_array_view::<f32>()?.iter().copied().collect();
-            Ok(gains)
+            let value = outputs
+                .get("m")
+                .ok_or_else(|| anyhow!("ERB decoder missing output 'm'"))?;
+            let (_, gains) = value.try_extract_tensor::<f32>()?;
+            Ok(gains.to_vec())
         }
 
-        fn run_df_decoder(&self, enc: &EncoderOutput) -> Result<Vec<[Complex32; DF_ORDER]>> {
-            // Inputs: emb, c0
-            let result = self
-                .df_decoder
-                .run(tvec![enc.emb.clone(), enc.c0.clone(),])?;
+        fn run_df_decoder(&mut self, enc: &EncoderOutput) -> Result<Vec<[Complex32; DF_ORDER]>> {
+            let outputs = self.df_decoder.run(ort::inputs![
+                "emb" => EncoderOutput::tensor_ref(&enc.emb)?,
+                "c0" => EncoderOutput::tensor_ref(&enc.c0)?
+            ])?;
 
-            // Output: coefficients reshaped to [NB_DF, DF_ORDER, 2] (real/imag)
-            let raw: Vec<f32> = result[0].to_array_view::<f32>()?.iter().copied().collect();
+            let value = outputs
+                .get("coefs")
+                .ok_or_else(|| anyhow!("DF decoder missing output 'coefs'"))?;
+            let (_, raw) = value.try_extract_tensor::<f32>()?;
 
             let mut coefs = Vec::with_capacity(NB_DF);
             for i in 0..NB_DF {
@@ -309,7 +357,6 @@ mod inner {
         }
 
         fn apply_erb_gains(&mut self, gains: &[f32]) {
-            // Interpolate 32 ERB gains back to 481 frequency bins
             let mut bin = 0usize;
             for (band, &width) in ERB_WIDTHS.iter().enumerate() {
                 let g = if band < gains.len() {
@@ -327,71 +374,58 @@ mod inner {
         }
 
         fn apply_deep_filtering(&mut self, coefs: &[[Complex32; DF_ORDER]]) {
-            // Shift DF buffer (ring buffer of last DF_ORDER spectra)
-            self.df_buf.rotate_left(1);
-            let last = self.df_buf.last_mut().unwrap();
-            for i in 0..NB_DF {
-                last[i] = self.spectrum[i];
-            }
-
-            // Apply deep filtering: for each of first NB_DF bins,
-            // output = sum(coefs[i][j] * df_buf[j][i]) for j in 0..DF_ORDER
+            // df_buf is already populated (before ERB gains) with the noisy spectrum.
+            // coefs[bin][0] applies to the newest frame (last in df_buf),
+            // coefs[bin][DF_ORDER-1] applies to the oldest.
+            let last_idx = DF_ORDER - 1;
             for i in 0..NB_DF {
                 let mut sum = Complex32::new(0.0, 0.0);
                 for j in 0..DF_ORDER {
-                    let buf_idx = j; // oldest to newest
-                    sum += coefs[i][j] * self.df_buf[buf_idx][i];
+                    sum += coefs[i][j] * self.df_buf[last_idx - j][i];
                 }
                 self.spectrum[i] = sum;
             }
         }
 
-        fn apply_df_fallback(&self) {
-            // No-op: spectrum already has ERB gains applied
-        }
-
         fn synthesize(&mut self, frame: &mut [f32]) {
-            // Reconstruct full spectrum (conjugate symmetry)
-            let mut ifft_buf = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
-            ifft_buf[..FREQ_SIZE].copy_from_slice(&self.spectrum[..FREQ_SIZE]);
+            self.ifft_buf.fill(Complex32::new(0.0, 0.0));
+            self.ifft_buf[..FREQ_SIZE].copy_from_slice(&self.spectrum[..FREQ_SIZE]);
             for i in 1..FFT_SIZE / 2 {
-                ifft_buf[FFT_SIZE - i] = self.spectrum[i].conj();
+                self.ifft_buf[FFT_SIZE - i] = self.spectrum[i].conj();
             }
 
-            // Inverse FFT
             self.fft_inverse
-                .process_with_scratch(&mut ifft_buf, &mut self.fft_scratch);
+                .process_with_scratch(&mut self.ifft_buf, &mut self.fft_scratch);
 
-            // Normalize + apply synthesis window + overlap-add
             let norm = 1.0 / FFT_SIZE as f32;
             for i in 0..FFT_SIZE {
-                let sample = ifft_buf[i].re * norm * self.synthesis_window[i];
+                let sample = self.ifft_buf[i].re * norm * self.synthesis_window[i];
                 self.output_buf[i] += sample;
             }
 
-            // Output the first HOP_SIZE samples
             frame.copy_from_slice(&self.output_buf[..HOP_SIZE]);
-
-            // Shift overlap buffer
             self.output_buf.copy_within(HOP_SIZE.., 0);
             self.output_buf[FFT_SIZE - HOP_SIZE..].fill(0.0);
         }
     }
 
-    struct EncoderOutput {
-        e0: TValue,
-        e1: TValue,
-        e2: TValue,
-        e3: TValue,
-        emb: TValue,
-        c0: TValue,
-        _lsnr: TValue,
-    }
-
     impl Processor for DeepFilterProcessor {
         fn process(&mut self, samples: &mut [f32]) -> ProcessResult {
+            if self.is_failed() {
+                return ProcessResult { vad: None };
+            }
+
             for chunk in samples.chunks_exact_mut(HOP_SIZE) {
                 self.process_frame(chunk);
+
+                if self.is_failed() {
+                    tracing::error!(
+                        "DeepFilter inference failed {} times — disabling. \
+                         Audio will pass through unprocessed.",
+                        self.error_count
+                    );
+                    return ProcessResult { vad: None };
+                }
             }
             ProcessResult { vad: None }
         }
@@ -399,12 +433,15 @@ mod inner {
         fn reset(&mut self) {
             self.input_buf.fill(0.0);
             self.output_buf.fill(0.0);
+            self.fft_buf.fill(Complex32::new(0.0, 0.0));
+            self.ifft_buf.fill(Complex32::new(0.0, 0.0));
             self.erb_norm_state = 0.0;
             self.spec_norm_state.fill(0.0);
             for buf in &mut self.df_buf {
                 buf.fill(Complex32::new(0.0, 0.0));
             }
             self.frame_count = 0;
+            self.error_count = 0;
         }
     }
 }
@@ -421,6 +458,10 @@ pub struct DeepFilterProcessor;
 impl DeepFilterProcessor {
     pub fn from_model_dir(_path: &std::path::Path) -> anyhow::Result<Self> {
         anyhow::bail!("DeepFilterNet support not compiled in. Rebuild with --features deepfilter")
+    }
+
+    pub fn is_failed(&self) -> bool {
+        true
     }
 }
 

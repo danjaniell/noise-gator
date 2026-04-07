@@ -5,13 +5,13 @@ use std::sync::{
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Stream, StreamConfig};
+use cpal::{SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 
 use crate::config::{DenoiseEngine, RuntimeSettings};
 use crate::dsp::autogain::AutoGain;
 use crate::dsp::deepfilter::DeepFilterProcessor;
-use crate::dsp::denoise::{Denoiser, FRAME_SIZE};
+use crate::dsp::denoise::{DualPassDenoiser, FRAME_SIZE};
 use crate::dsp::energy_vad::EnergyVad;
 use crate::dsp::eq::ThreeBandEq;
 use crate::dsp::gate::NoiseGate;
@@ -240,13 +240,13 @@ impl Pipeline {
         // ── Input callback (DSP chain) ──────────────────────────────────
         let mut highpass = HighPassFilter::default_80hz();
         let engine = self.settings.load_engine();
-        let mut rnnoise_denoiser: Option<Denoiser> = None;
+        let mut rnnoise_denoiser: Option<DualPassDenoiser> = None;
         let mut deepfilter_denoiser: Option<DeepFilterProcessor> = None;
         let mut energy_vad: Option<EnergyVad> = None;
 
         match engine {
             DenoiseEngine::RNNoise => {
-                rnnoise_denoiser = Some(Denoiser::new());
+                rnnoise_denoiser = Some(DualPassDenoiser::new());
             }
             DenoiseEngine::DeepFilter => {
                 match crate::models::ensure_deepfilter_model()
@@ -258,7 +258,7 @@ impl Pipeline {
                     }
                     Err(e) => {
                         tracing::error!("Failed to load DeepFilter, falling back to RNNoise: {e}");
-                        rnnoise_denoiser = Some(Denoiser::new());
+                        rnnoise_denoiser = Some(DualPassDenoiser::new());
                     }
                 }
             }
@@ -295,10 +295,11 @@ impl Pipeline {
         };
 
         let input_settings = Arc::clone(&self.settings);
+        let in_sample_format = in_supported.sample_format();
 
-        let input_stream = input_device.build_input_stream(
-            &in_cfg,
-            move |data: &[f32], _| {
+        // Core audio processing closure — works on F32 samples regardless of
+        // the native device format. Shared between F32 and I16 stream paths.
+        let mut process_audio = move |data_f32: &[f32]| {
                 if PIPELINE_ID.load(Ordering::SeqCst) != my_id {
                     return;
                 }
@@ -307,11 +308,11 @@ impl Pipeline {
                 let denoise_on = input_settings.denoise_enabled.load(Ordering::Relaxed);
 
                 // 1. Downmix to mono + input gain (zero-alloc: reuses pre-allocated buffer)
-                let mono_len = data.len() / in_channels;
+                let mono_len = data_f32.len() / in_channels;
                 if mono_buf.len() < mono_len {
                     mono_buf.resize(mono_len, 0.0);
                 }
-                for (i, chunk) in data.chunks(in_channels).enumerate() {
+                for (i, chunk) in data_f32.chunks(in_channels).enumerate() {
                     mono_buf[i] = (chunk.iter().sum::<f32>() / in_channels as f32) * i_gain;
                 }
                 let mono = &mono_buf[..mono_len];
@@ -375,9 +376,27 @@ impl Pipeline {
                             None
                         };
 
-                        // Run the active denoise engine
+                        // Run the active denoise engine.
+                        // If DeepFilter has permanently failed (inference errors),
+                        // auto-fallback to RNNoise mid-stream.
                         let result = if let Some(ref mut df) = deepfilter_denoiser {
-                            df.process(&mut frame)
+                            if df.is_failed() {
+                                // Lazy-init RNNoise fallback on first failure
+                                if rnnoise_denoiser.is_none() {
+                                    tracing::warn!(
+                                        "DeepFilter permanently failed — \
+                                         falling back to RNNoise"
+                                    );
+                                    rnnoise_denoiser = Some(DualPassDenoiser::new());
+                                }
+                                if let Some(ref mut rnn) = rnnoise_denoiser {
+                                    rnn.process(&mut frame)
+                                } else {
+                                    ProcessResult::default()
+                                }
+                            } else {
+                                df.process(&mut frame)
+                            }
                         } else if let Some(ref mut rnn) = rnnoise_denoiser {
                             rnn.process(&mut frame)
                         } else {
@@ -439,16 +458,44 @@ impl Pipeline {
                 if read_pos > 0 {
                     accumulator.drain(..read_pos);
                 }
-            },
-            {
+        };
+
+        let err_callback = {
                 let error_flag = Arc::clone(&error_flag);
                 move |err| {
                     tracing::error!("Input error: {err}");
                     error_flag.store(true, Ordering::Relaxed);
                 }
-            },
-            None,
-        )?;
+        };
+
+        // Build input stream — use I16 stream with conversion for devices
+        // that don't support F32 natively (e.g., Bluetooth SCO headsets).
+        let input_stream: Stream = match in_sample_format {
+            SampleFormat::I16 => {
+                let mut i16_conv_buf: Vec<f32> = Vec::with_capacity(8192);
+                input_device.build_input_stream(
+                    &in_cfg,
+                    move |data: &[i16], _| {
+                        // Convert I16 → F32 (range -1.0..1.0)
+                        i16_conv_buf.clear();
+                        i16_conv_buf.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
+                        process_audio(&i16_conv_buf);
+                    },
+                    err_callback,
+                    None,
+                )?
+            }
+            _ => {
+                input_device.build_input_stream(
+                    &in_cfg,
+                    move |data: &[f32], _| {
+                        process_audio(data);
+                    },
+                    err_callback,
+                    None,
+                )?
+            }
+        };
 
         input_stream.play()?;
 

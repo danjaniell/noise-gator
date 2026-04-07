@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Config file
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 # Error handling
@@ -53,7 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 ctrlc = "3"
 
 # DeepFilterNet inference — optional, only pulled in with `deepfilter` feature
-tract-onnx = { version = "0.21", optional = true }
+ort = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["ndarray", "load-dynamic"] }
 rustfft = { version = "6", optional = true }
 ndarray = { version = "0.16", optional = true }
 
@@ -63,6 +64,7 @@ sha2 = { version = "0.10", optional = true }
 # Archive extraction for model downloads
 flate2 = "1"
 tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # PNG decoding for tray icon
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -77,16 +79,20 @@ glutin-winit = "0.5"
 raw-window-handle = "0.6"
 
 # Platform-specific
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
+    "Win32_System_Threading",
 ] }
 
 [features]
 default = ["deepfilter"]
-deepfilter = ["dep:tract-onnx", "dep:rustfft", "dep:ndarray", "dep:sha2"]
+deepfilter = ["dep:ort", "dep:rustfft", "dep:ndarray", "dep:sha2"]
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -96,3 +102,11 @@ opt-level = 3
 lto = true
 strip = true
 codegen-units = 1
+
+# Fast optimized build for local testing (no LTO)
+# Usage: cargo build --profile dev-release
+[profile.dev-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false

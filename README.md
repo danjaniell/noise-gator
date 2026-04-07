@@ -19,15 +19,20 @@
 
 Noise Gator is a standalone system tray application that captures your microphone input, runs it through a real-time noise suppression pipeline, and routes the clean audio to a virtual audio device. Other applications (Discord, Teams, Zoom) pick up the virtual device as their microphone input.
 
-No Electron. No web runtime. A single ~23MB binary.
+No Electron. No web runtime. A single ~9MB binary (ONNX Runtime DLL bundled separately in release zip).
 
 ## Features
 
-- **Dual denoise engines** -- [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (default) and [RNNoise](https://github.com/xiph/rnnoise) (lightweight fallback)
-- **DSP pipeline** -- Highpass pre-filter, noise suppression, VAD-driven noise gate, 3-band EQ, auto-gain normalization
+- **Dual denoise engines** -- [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (ONNX Runtime, default) and [RNNoise](https://github.com/xiph/rnnoise) dual-pass (lightweight fallback)
+- **DSP pipeline** -- Highpass pre-filter, suppression level control, VAD-driven noise gate, 3-band EQ (Voice Clarity), auto-gain normalization
+- **Settings window** -- egui-based panel with suppression level, audio meters, voice gate threshold, EQ presets, and auto gain
 - **System tray control** -- Start/stop, device selection, engine switching, DSP toggles -- all from the tray menu
+- **System Default device** -- Input device can be set to "System Default" to follow the OS default; switching headsets in Windows is picked up automatically
+- **Bluetooth support** -- Handles I16 sample format from Bluetooth SCO headsets with inline conversion
+- **Device hot-plug** -- Tray menu refreshes on click to show newly connected devices; watchdog auto-reconnects on USB/BT disconnect
+- **Single instance** -- Only one copy of Noise Gator can run at a time (Windows named mutex, Unix flock)
 - **Virtual audio driver** -- Auto-installs [VB-Cable](https://vb-audio.com/Cable/) on Windows or [BlackHole](https://existential.audio/blackhole/) on macOS
-- **Device watchdog** -- Detects USB disconnects and auto-reconnects when the device reappears
+- **Graceful fallback** -- Falls back to default devices if configured device is unavailable at startup
 - **Config persistence** -- Settings saved to TOML, restored on next launch
 - **Headless mode** -- Run without the tray via `--headless` for scripted or server use
 
@@ -45,7 +50,7 @@ Audio is captured from your real microphone, processed through the DSP chain at 
 
 ### Pre-built Binary
 
-Download the latest release from the [Releases](https://github.com/danjaniell/noise-gator/releases) page.
+Download the latest release from the [Releases](https://github.com/danjaniell/noise-gator/releases) page. The zip contains the executable and the ONNX Runtime DLL (required for DeepFilterNet).
 
 On first launch, Noise Gator will prompt to install VB-Cable if it is not already present.
 
@@ -96,9 +101,9 @@ noise-gator --skip-driver
 | Engine | Quality | Size | VAD | Availability |
 |--------|---------|------|-----|-------------|
 | [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | Superior | ~8MB model download on first use | Energy-based | Default |
-| [RNNoise](https://github.com/xiph/rnnoise) | Good | Bundled (0MB extra) | Neural | Always available |
+| [RNNoise](https://github.com/xiph/rnnoise) (dual-pass) | Good | Bundled (0MB extra) | Neural | Always available |
 
-DeepFilterNet is the default engine. On first use, the ONNX model (~8MB) downloads automatically. RNNoise is available as a lightweight fallback and can be selected from the system tray Engine menu. Build with `--no-default-features` to exclude DeepFilterNet entirely.
+DeepFilterNet uses ONNX Runtime (loaded dynamically) with three model files (encoder, ERB decoder, DF decoder). On first use, the runtime and model (~8MB) download automatically with SHA256 verification. RNNoise runs two passes for stronger suppression and can be selected from the tray Engine menu. Build with `--no-default-features` to exclude DeepFilterNet entirely.
 
 ## Configuration
 
@@ -111,13 +116,14 @@ Settings are saved to:
 
 | Crate | Purpose |
 |-------|---------|
-| [cpal](https://crates.io/crates/cpal) | Cross-platform audio I/O |
+| [cpal](https://crates.io/crates/cpal) | Cross-platform audio I/O (WASAPI, CoreAudio, ALSA) |
 | [nnnoiseless](https://crates.io/crates/nnnoiseless) | Pure Rust RNNoise port |
+| [ort](https://crates.io/crates/ort) | ONNX Runtime bindings (optional, DeepFilterNet) |
 | [tray-icon](https://crates.io/crates/tray-icon) + [muda](https://crates.io/crates/muda) | System tray and menu |
 | [winit](https://crates.io/crates/winit) | Event loop |
+| [egui](https://crates.io/crates/egui) + [egui_glow](https://crates.io/crates/egui_glow) | Settings window GUI |
 | [rubato](https://crates.io/crates/rubato) | Sinc sample rate conversion |
 | [ringbuf](https://crates.io/crates/ringbuf) | Lock-free ring buffer |
-| [tract-onnx](https://crates.io/crates/tract-onnx) | ONNX inference (optional, DeepFilterNet) |
 | [rustfft](https://crates.io/crates/rustfft) | FFT for STFT/ISTFT (optional, DeepFilterNet) |
 | [clap](https://crates.io/crates/clap) | CLI argument parsing |
 | [reqwest](https://crates.io/crates/reqwest) | HTTP for driver/model downloads |

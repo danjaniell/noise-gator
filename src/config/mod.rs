@@ -13,12 +13,26 @@ use crate::dsp::gate::GateSettings;
 /// Available noise suppression engines.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum DenoiseEngine {
     /// RNNoise via nnnoiseless — lightweight, always available, has neural VAD.
     #[default]
-    RNNoise,
-    /// DeepFilterNet via tract-onnx — higher quality, requires model download.
-    DeepFilter,
+    RNNoise = 0,
+    /// DeepFilterNet via ort (ONNX Runtime) — higher quality, handles non-stationary noise.
+    DeepFilter = 1,
+}
+
+impl DenoiseEngine {
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::DeepFilter,
+            _ => Self::RNNoise,
+        }
+    }
 }
 
 impl std::fmt::Display for DenoiseEngine {
@@ -182,17 +196,14 @@ impl RuntimeSettings {
             autogain_enabled: AtomicBool::new(cfg.autogain.enabled),
             autogain_target_rms: AtomicU32::new(cfg.autogain.target_rms.to_bits()),
             autogain_max_gain: AtomicU32::new(cfg.autogain.max_gain.to_bits()),
-            engine: std::sync::atomic::AtomicU8::new(cfg.engine as u8),
+            engine: std::sync::atomic::AtomicU8::new(cfg.engine.as_u8()),
             suppression_level: AtomicU32::new(cfg.suppression_level.to_bits()),
             advanced_eq: AtomicBool::new(cfg.advanced_eq),
         }
     }
 
     pub fn load_engine(&self) -> DenoiseEngine {
-        match self.engine.load(Ordering::Relaxed) {
-            1 => DenoiseEngine::DeepFilter,
-            _ => DenoiseEngine::RNNoise,
-        }
+        DenoiseEngine::from_u8(self.engine.load(Ordering::Relaxed))
     }
 
     /// Read current gate settings from atomics.

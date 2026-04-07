@@ -1,13 +1,15 @@
-//! Download and cache management for DeepFilterNet ONNX model files.
+//! Download and cache management for DeepFilterNet ONNX model files
+//! and ONNX Runtime shared library.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 
 const DEEPFILTER_MODEL_URL: &str =
     "https://github.com/Rikorose/DeepFilterNet/raw/main/models/DeepFilterNet3_onnx.tar.gz";
 
-const DEEPFILTER_SHA256: &str = "";
+const DEEPFILTER_SHA256: &str =
+    "ec426ba25083b97093a1045196f189ba453582b468484ffaacecf18ba4a4a708";
 
 const MODELS_DIR: &str = "models";
 
@@ -50,11 +52,7 @@ pub fn ensure_deepfilter_model() -> Result<PathBuf> {
         .bytes()
         .map_err(|e| anyhow!("Failed to read model download: {e}"))?;
 
-    if !DEEPFILTER_SHA256.is_empty() {
-        verify_sha256(&bytes, DEEPFILTER_SHA256)?;
-    } else {
-        tracing::warn!("No SHA256 hash pinned for model — skipping verification");
-    }
+    verify_sha256(&bytes, DEEPFILTER_SHA256)?;
 
     std::fs::create_dir_all(&model_dir)?;
     extract_tar_gz(&bytes, &model_dir)?;
@@ -93,12 +91,17 @@ fn verify_sha256(_data: &[u8], _expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_tar_gz(data: &[u8], dest: &PathBuf) -> Result<()> {
+fn extract_tar_gz(data: &[u8], dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(false);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
+        // Only extract regular files — skip symlinks, hardlinks, directories
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
         let path = entry.path()?;
         if let Some(file_name) = path.file_name() {
             let target = dest.join(file_name);
@@ -106,5 +109,211 @@ fn extract_tar_gz(data: &[u8], dest: &PathBuf) -> Result<()> {
             std::io::copy(&mut entry, &mut file)?;
         }
     }
+    Ok(())
+}
+
+// ── ONNX Runtime shared library management ─────────────────────────────
+
+/// Expected DLL/dylib filename per platform.
+#[cfg(target_os = "windows")]
+const ORT_LIB_NAME: &str = "onnxruntime.dll";
+#[cfg(target_os = "macos")]
+const ORT_LIB_NAME: &str = "libonnxruntime.dylib";
+#[cfg(target_os = "linux")]
+const ORT_LIB_NAME: &str = "libonnxruntime.so";
+
+/// Platform suffix used in ONNX Runtime release asset names.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const ORT_PLATFORM: &str = "win-x64";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const ORT_PLATFORM: &str = "osx-x86_64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ORT_PLATFORM: &str = "osx-arm64";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const ORT_PLATFORM: &str = "linux-x64";
+
+/// Resolve the download URL for the latest ONNX Runtime release.
+/// Queries the GitHub API to find the newest version and matching asset.
+fn resolve_ort_download_url() -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("noise-gator")
+        .build()?;
+
+    let response = client
+        .get("https://api.github.com/repos/microsoft/onnxruntime/releases/latest")
+        .send()
+        .map_err(|e| anyhow!("Failed to query ONNX Runtime releases: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("GitHub API error: {e}"))?;
+
+    let body = response.text()?;
+    let resp: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow!("Failed to parse GitHub API response: {e}"))?;
+
+    let needle = format!("onnxruntime-{ORT_PLATFORM}");
+    let assets = resp["assets"]
+        .as_array()
+        .ok_or_else(|| anyhow!("GitHub API response missing 'assets' array"))?;
+
+    for asset in assets {
+        let name = asset["name"].as_str().unwrap_or("");
+        let url = asset["browser_download_url"].as_str().unwrap_or("");
+
+        if !name.contains(&needle) || name.contains("gpu") || name.contains("GPU") {
+            continue;
+        }
+        if url.ends_with(".zip") || url.ends_with(".tgz") {
+            tracing::info!("Resolved ONNX Runtime URL: {url}");
+            return Ok(url.to_string());
+        }
+    }
+
+    Err(anyhow!(
+        "No ONNX Runtime asset found for platform '{ORT_PLATFORM}'"
+    ))
+}
+
+/// Directory where ONNX Runtime library is cached.
+fn ort_lib_dir() -> PathBuf {
+    model_base_dir().join("ort")
+}
+
+/// Full path to the ONNX Runtime shared library.
+pub fn ort_lib_path() -> PathBuf {
+    ort_lib_dir().join(ORT_LIB_NAME)
+}
+
+/// Check if ONNX Runtime is already available.
+pub fn is_ort_available() -> bool {
+    ort_lib_path().exists()
+}
+
+/// Download and extract ONNX Runtime if not already cached.
+pub fn ensure_onnxruntime() -> Result<PathBuf> {
+    let lib_path = ort_lib_path();
+
+    if lib_path.exists() {
+        tracing::info!("ONNX Runtime already cached at {}", lib_path.display());
+        return Ok(lib_path);
+    }
+
+    let url = resolve_ort_download_url()?;
+    tracing::info!("Downloading ONNX Runtime from {url}");
+
+    let response = reqwest::blocking::get(&url)
+        .map_err(|e| anyhow!("Failed to download ONNX Runtime: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "ONNX Runtime download failed with status: {}",
+            response.status()
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .map_err(|e| anyhow!("Failed to read ONNX Runtime download: {e}"))?;
+
+    let dest = ort_lib_dir();
+    std::fs::create_dir_all(&dest)?;
+
+    if url.ends_with(".zip") {
+        extract_zip_lib(&bytes, &dest)?;
+    } else {
+        extract_tgz_lib(&bytes, &dest)?;
+    }
+
+    if !lib_path.exists() {
+        return Err(anyhow!(
+            "ONNX Runtime extraction succeeded but {} not found",
+            ORT_LIB_NAME
+        ));
+    }
+
+    tracing::info!("ONNX Runtime installed to {}", lib_path.display());
+    Ok(lib_path)
+}
+
+/// Extract the shared library from the ONNX Runtime zip archive.
+/// The zip contains a directory like `onnxruntime-win-x64-1.21.1/lib/onnxruntime.dll`.
+fn extract_zip_lib(data: &[u8], dest: &Path) -> Result<()> {
+    use std::io::Cursor;
+
+    let reader = Cursor::new(data);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| anyhow!("Failed to open zip: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| anyhow!("Failed to read zip entry: {e}"))?;
+
+        let name = file.name().to_string();
+
+        // Look for the shared library in the lib/ directory
+        if name.ends_with(ORT_LIB_NAME) {
+            let target = dest.join(ORT_LIB_NAME);
+            let mut out = std::fs::File::create(&target)?;
+            std::io::copy(&mut file, &mut out)?;
+            tracing::debug!("Extracted {name} → {}", target.display());
+            return Ok(());
+        }
+    }
+
+    Err(anyhow!(
+        "{} not found in ONNX Runtime zip archive",
+        ORT_LIB_NAME
+    ))
+}
+
+/// Extract the shared library from an ONNX Runtime .tgz archive (macOS/Linux).
+fn extract_tgz_lib(data: &[u8], dest: &Path) -> Result<()> {
+    let gz = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(gz);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let is_match = entry
+            .path()?
+            .to_string_lossy()
+            .ends_with(ORT_LIB_NAME);
+
+        if is_match {
+            let target = dest.join(ORT_LIB_NAME);
+            let mut out = std::fs::File::create(&target)?;
+            std::io::copy(&mut entry, &mut out)?;
+            tracing::debug!("Extracted {} → {}", ORT_LIB_NAME, target.display());
+            return Ok(());
+        }
+    }
+
+    Err(anyhow!(
+        "{} not found in ONNX Runtime tgz archive",
+        ORT_LIB_NAME
+    ))
+}
+
+/// Initialize the ort crate with our cached ONNX Runtime library.
+/// Must be called before any ort Session is created.
+/// Idempotent — safe to call multiple times (only the first call initializes).
+#[cfg(feature = "deepfilter")]
+pub fn init_ort() -> Result<()> {
+    use std::sync::OnceLock;
+    static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    let result = ORT_INIT.get_or_init(|| {
+        let lib_path = ensure_onnxruntime().map_err(|e| e.to_string())?;
+        ort::init_from(lib_path.to_string_lossy().to_string())
+            .commit()
+            .map_err(|e| e.to_string())?;
+        tracing::info!("ONNX Runtime initialized");
+        Ok(())
+    });
+
+    result.as_ref().map_err(|e| anyhow!("{e}")).copied()
+}
+
+#[cfg(not(feature = "deepfilter"))]
+pub fn init_ort() -> Result<()> {
     Ok(())
 }

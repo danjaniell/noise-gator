@@ -24,7 +24,7 @@ pub fn run(pipeline: Arc<Pipeline>, config: Config) -> Result<()> {
         pipeline,
         config,
         menu_state: None,
-        _tray_icon: None,
+        tray_icon: None,
         settings_window: None,
         open_settings: false,
     };
@@ -37,14 +37,14 @@ struct TrayApp {
     pipeline: Arc<Pipeline>,
     config: Config,
     menu_state: Option<MenuState>,
-    _tray_icon: Option<tray_icon::TrayIcon>,
+    tray_icon: Option<tray_icon::TrayIcon>,
     settings_window: Option<SettingsWindowState>,
     open_settings: bool,
 }
 
 impl ApplicationHandler for TrayApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
-        if self._tray_icon.is_some() {
+        if self.tray_icon.is_some() {
             return; // Already initialized
         }
 
@@ -60,7 +60,7 @@ impl ApplicationHandler for TrayApp {
             .build()
         {
             Ok(tray) => {
-                self._tray_icon = Some(tray);
+                self.tray_icon = Some(tray);
                 tracing::info!("System tray initialized");
             }
             Err(e) => {
@@ -103,7 +103,10 @@ impl ApplicationHandler for TrayApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Drain all pending menu events
+        // Drain menu events FIRST — before rebuilding the menu from tray
+        // icon events. Rebuilding creates new MenuIds; if we rebuild first,
+        // clicks on the old (visible) menu carry stale IDs that no longer
+        // match menu_state, so the event is silently dropped.
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             if let Some(ref menu_state) = self.menu_state {
                 if *event.id() == menu_state.settings_id {
@@ -120,6 +123,17 @@ impl ApplicationHandler for TrayApp {
             }
         }
 
+        // Rebuild menu on tray icon click so device list stays fresh
+        // (e.g., Bluetooth headset connected after app started).
+        // This runs AFTER menu event processing to avoid invalidating IDs.
+        while let Ok(_event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            let (menu, menu_state) = menu::build_menu(&self.config, &self.pipeline);
+            self.menu_state = Some(menu_state);
+            if let Some(ref tray) = self.tray_icon {
+                let _ = tray.set_menu(Some(Box::new(menu)));
+            }
+        }
+
         // Open settings window after processing events (needs ActiveEventLoop)
         if self.open_settings {
             self.open_settings = false;
@@ -129,6 +143,8 @@ impl ApplicationHandler for TrayApp {
                     event_loop,
                     Arc::clone(&self.pipeline.settings),
                     Arc::clone(&self.pipeline),
+                    self.config.input_device.as_deref(),
+                    self.config.output_device.as_deref(),
                 );
             }
         }

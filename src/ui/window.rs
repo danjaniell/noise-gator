@@ -174,6 +174,8 @@ impl SettingsWindowState {
         event_loop: &ActiveEventLoop,
         settings: Arc<RuntimeSettings>,
         pipeline: Arc<Pipeline>,
+        input_device: Option<&str>,
+        output_device: Option<&str>,
     ) -> Option<Self> {
         let glutin_ctx = match unsafe { GlutinContext::new(event_loop) } {
             Ok(ctx) => ctx,
@@ -199,7 +201,7 @@ impl SettingsWindowState {
             glutin_ctx,
             gl,
             egui_glow,
-            app: SettingsApp::new(settings, pipeline),
+            app: SettingsApp::new(settings, pipeline, input_device, output_device),
         })
     }
 

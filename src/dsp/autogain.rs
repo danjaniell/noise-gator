@@ -40,11 +40,11 @@ impl Default for AutoGainSettings {
     fn default() -> Self {
         Self {
             target_rms: 0.1,
-            max_gain: 10.0,
+            max_gain: 4.0,
             min_gain: 1.0,
             rms_smoothing: 0.95,
             gain_smoothing: 0.99,
-            silence_threshold: 0.001,
+            silence_threshold: 0.005,
             enabled: true,
         }
     }
@@ -65,10 +65,6 @@ impl AutoGain {
         self.settings = new;
     }
 
-    #[allow(dead_code)]
-    pub fn settings(&self) -> &AutoGainSettings {
-        &self.settings
-    }
 }
 
 impl Processor for AutoGain {
