@@ -195,9 +195,9 @@ jobs:
             platform: windows
             zip_name: noise-gator-windows.zip
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin
             artifact: noise-gator
-            ort_platform: osx-x86_64
+            ort_platform: osx-arm64
             ort_ext: tgz
             ort_lib: libonnxruntime.dylib
             platform: macos
