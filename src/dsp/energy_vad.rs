@@ -1,4 +1,4 @@
-use super::{ProcessResult, Processor};
+use super::{ProcessResult, Processor, time_to_coeff};
 
 /// Simple RMS-based voice activity detector.
 ///
@@ -14,8 +14,6 @@ pub struct EnergyVad {
     release_coeff: f32,
 }
 
-const SAMPLE_RATE: f32 = 48_000.0;
-
 impl EnergyVad {
     /// Create with sensible defaults for post-denoise audio.
     pub fn new() -> Self {
@@ -26,13 +24,6 @@ impl EnergyVad {
             release_coeff: time_to_coeff(80.0),
         }
     }
-}
-
-fn time_to_coeff(ms: f32) -> f32 {
-    if ms <= 0.0 {
-        return 0.0;
-    }
-    (-1.0 / (ms * SAMPLE_RATE / 1000.0)).exp()
 }
 
 impl Processor for EnergyVad {

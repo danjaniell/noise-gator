@@ -227,6 +227,7 @@ pub fn handle_event(
             .settings
             .denoise_enabled
             .store(!current, Ordering::Relaxed);
+        pipeline.settings.mark_dirty();
         tracing::info!("Denoise: {}", !current);
         return;
     }
@@ -241,6 +242,7 @@ pub fn handle_event(
             .settings
             .eq_enabled
             .store(!current, Ordering::Relaxed);
+        pipeline.settings.mark_dirty();
         tracing::info!("EQ: {}", !current);
         return;
     }

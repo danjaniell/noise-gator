@@ -159,13 +159,14 @@ impl ApplicationHandler for TrayApp {
     }
 }
 
-/// Load the app icon from the embedded PNG for use as the system tray icon.
+/// Load the pre-sized 32x32 app icon from the embedded PNG for use as the system tray icon.
 fn load_icon() -> tray_icon::Icon {
-    let png_bytes = include_bytes!("../../img/noise-gator.png");
-    let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
-        .expect("Failed to decode embedded icon PNG");
-    let resized = img.resize(32, 32, image::imageops::FilterType::Lanczos3);
-    let rgba = resized.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).expect("Failed to create tray icon")
+    let png_bytes = include_bytes!("../../img/noise-gator-32.png");
+    let cursor = std::io::Cursor::new(png_bytes.as_slice());
+    let decoder = png::Decoder::new(cursor);
+    let mut reader = decoder.read_info().expect("Failed to read PNG header");
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG output buffer size")];
+    let info = reader.next_frame(&mut buf).expect("Failed to decode PNG");
+    let rgba = buf[..info.buffer_size()].to_vec();
+    tray_icon::Icon::from_rgba(rgba, info.width, info.height).expect("Failed to create tray icon")
 }

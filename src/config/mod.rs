@@ -175,6 +175,9 @@ pub struct RuntimeSettings {
     pub suppression_level: AtomicU32,
     // UI preference (not read by audio thread)
     pub advanced_eq: AtomicBool,
+    /// Dirty flag — set by UI when any DSP setting changes. Audio callback
+    /// checks once per callback and clears it, avoiding redundant atomic loads.
+    pub settings_dirty: AtomicBool,
 }
 
 impl RuntimeSettings {
@@ -199,7 +202,14 @@ impl RuntimeSettings {
             engine: std::sync::atomic::AtomicU8::new(cfg.engine.as_u8()),
             suppression_level: AtomicU32::new(cfg.suppression_level.to_bits()),
             advanced_eq: AtomicBool::new(cfg.advanced_eq),
+            settings_dirty: AtomicBool::new(true), // force initial load
         }
+    }
+
+    /// Signal that DSP settings have changed. Audio callback will pick up
+    /// new values on next iteration.
+    pub fn mark_dirty(&self) {
+        self.settings_dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn load_engine(&self) -> DenoiseEngine {

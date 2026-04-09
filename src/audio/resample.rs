@@ -5,10 +5,13 @@ use rubato::{Fft, FixedSync, Resampler};
 ///
 /// `rubato` operates on fixed-size chunks. This wrapper handles buffering
 /// input samples until a full chunk is available, then resamples in bulk.
+/// All buffers are pre-allocated — zero heap allocation in the hot path.
 pub struct StreamResampler {
     resampler: Fft<f32>,
     input_buf: Vec<f32>,
     output_buf: Vec<f32>,
+    chunk_staging: Vec<f32>,
+    process_output: Vec<f32>,
     chunk_size: usize,
 }
 
@@ -25,19 +28,23 @@ impl StreamResampler {
             resampler,
             input_buf: Vec::with_capacity(chunk_size * 2),
             output_buf: vec![0.0f32; max_output],
+            chunk_staging: vec![0.0f32; chunk_size],
+            process_output: Vec::with_capacity(max_output * 4),
             chunk_size,
         }
     }
 
     /// Feed input samples and get resampled output.
     /// May return empty if not enough input has accumulated for a full chunk.
-    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+    /// Returns a slice into a pre-allocated buffer — zero heap allocation.
+    pub fn process(&mut self, input: &[f32]) -> &[f32] {
         self.input_buf.extend_from_slice(input);
-
-        let mut output = Vec::new();
+        self.process_output.clear();
 
         while self.input_buf.len() >= self.chunk_size {
-            let chunk: Vec<f32> = self.input_buf.drain(..self.chunk_size).collect();
+            // Copy chunk into staging buffer instead of drain().collect()
+            self.chunk_staging.copy_from_slice(&self.input_buf[..self.chunk_size]);
+            self.input_buf.drain(..self.chunk_size);
 
             // Ensure output buffer is large enough
             let needed = self.resampler.output_frames_next();
@@ -46,7 +53,8 @@ impl StreamResampler {
             }
 
             // rubato 2.0: InterleavedSlice adapters for mono (1 channel)
-            let input_adapter = InterleavedSlice::new(&chunk, 1, self.chunk_size).unwrap();
+            let input_adapter =
+                InterleavedSlice::new(&self.chunk_staging, 1, self.chunk_size).unwrap();
             let mut output_adapter =
                 InterleavedSlice::new_mut(&mut self.output_buf, 1, needed).unwrap();
 
@@ -55,7 +63,8 @@ impl StreamResampler {
                 .process_into_buffer(&input_adapter, &mut output_adapter, None)
             {
                 Ok((_in_frames, out_frames)) => {
-                    output.extend_from_slice(&self.output_buf[..out_frames]);
+                    self.process_output
+                        .extend_from_slice(&self.output_buf[..out_frames]);
                 }
                 Err(e) => {
                     tracing::warn!("Resampler error: {e}");
@@ -63,7 +72,7 @@ impl StreamResampler {
             }
         }
 
-        output
+        &self.process_output
     }
 
     /// Reset internal state (call when restarting pipeline).

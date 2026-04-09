@@ -159,15 +159,19 @@ impl Processor for ThreeBandEq {
             return ProcessResult::default();
         }
 
+        let use_bass = self.settings.bass_db.abs() > f32::EPSILON;
+        let use_mid = self.settings.mid_db.abs() > f32::EPSILON;
+        let use_treble = self.settings.treble_db.abs() > f32::EPSILON;
+
         for sample in samples.iter_mut() {
             let mut x = *sample as f64;
-            if self.settings.bass_db.abs() > f32::EPSILON {
+            if use_bass {
                 x = self.bass.process_sample(x);
             }
-            if self.settings.mid_db.abs() > f32::EPSILON {
+            if use_mid {
                 x = self.mid.process_sample(x);
             }
-            if self.settings.treble_db.abs() > f32::EPSILON {
+            if use_treble {
                 x = self.treble.process_sample(x);
             }
             *sample = x as f32;

@@ -30,18 +30,15 @@ pub fn download_and_install() -> Result<()> {
 
     // Download
     tracing::info!("Downloading VB-Cable from {}", VBCABLE_URL);
-    let response = reqwest::blocking::get(VBCABLE_URL)
+    let response = ureq::get(VBCABLE_URL)
+        .call()
         .map_err(|e| anyhow!("Failed to download VB-Cable: {e}"))?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Download failed with status: {}",
-            response.status()
-        ));
-    }
-
     let bytes = response
-        .bytes()
+        .into_body()
+        .with_config()
+        .limit(50 * 1024 * 1024) // 50 MB — VB-Cable zip is ~3 MB
+        .read_to_vec()
         .map_err(|e| anyhow!("Failed to read download: {e}"))?;
     std::fs::write(&zip_path, &bytes).map_err(|e| anyhow!("Failed to write zip: {e}"))?;
 

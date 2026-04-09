@@ -160,6 +160,9 @@ impl SettingsApp {
             });
         });
 
+        // Mark settings dirty so audio callback picks up any changes
+        self.settings.mark_dirty();
+
         // Repaints driven by tray event loop (ControlFlow::wait_duration)
     }
 }

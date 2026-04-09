@@ -1,15 +1,19 @@
 //! Download and cache management for DeepFilterNet ONNX model files
 //! and ONNX Runtime shared library.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(feature = "deepfilter")]
+use std::path::Path;
 
 use anyhow::{Result, anyhow};
 
+#[cfg(feature = "deepfilter")]
 const DEEPFILTER_MODEL_URL: &str =
-    "https://github.com/Rikorose/DeepFilterNet/raw/main/models/DeepFilterNet3_onnx.tar.gz";
+    "https://github.com/Rikorose/DeepFilterNet/raw/84d57ec2c08fe08e68a13fb32a58cd7092060a0f/models/DeepFilterNet3_onnx.tar.gz";
 
+#[cfg(feature = "deepfilter")]
 const DEEPFILTER_SHA256: &str =
-    "ec426ba25083b97093a1045196f189ba453582b468484ffaacecf18ba4a4a708";
+    "c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616";
 
 const MODELS_DIR: &str = "models";
 
@@ -25,6 +29,7 @@ pub fn is_deepfilter_available() -> bool {
         && dir.join("config.ini").exists()
 }
 
+#[cfg(feature = "deepfilter")]
 pub fn ensure_deepfilter_model() -> Result<PathBuf> {
     let model_dir = deepfilter_model_dir();
 
@@ -38,18 +43,15 @@ pub fn ensure_deepfilter_model() -> Result<PathBuf> {
 
     tracing::info!("Downloading DeepFilterNet model from {DEEPFILTER_MODEL_URL}");
 
-    let response = reqwest::blocking::get(DEEPFILTER_MODEL_URL)
+    let response = ureq::get(DEEPFILTER_MODEL_URL)
+        .call()
         .map_err(|e| anyhow!("Failed to download DeepFilterNet model: {e}"))?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Model download failed with status: {}",
-            response.status()
-        ));
-    }
-
     let bytes = response
-        .bytes()
+        .into_body()
+        .with_config()
+        .limit(50 * 1024 * 1024) // 50 MB — model tar.gz is ~8 MB
+        .read_to_vec()
         .map_err(|e| anyhow!("Failed to read model download: {e}"))?;
 
     verify_sha256(&bytes, DEEPFILTER_SHA256)?;
@@ -86,11 +88,8 @@ fn verify_sha256(data: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "deepfilter"))]
-fn verify_sha256(_data: &[u8], _expected: &str) -> Result<()> {
-    Ok(())
-}
 
+#[cfg(feature = "deepfilter")]
 fn extract_tar_gz(data: &[u8], dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
@@ -115,38 +114,37 @@ fn extract_tar_gz(data: &[u8], dest: &Path) -> Result<()> {
 // ── ONNX Runtime shared library management ─────────────────────────────
 
 /// Expected DLL/dylib filename per platform.
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "deepfilter", target_os = "windows"))]
 const ORT_LIB_NAME: &str = "onnxruntime.dll";
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "deepfilter", target_os = "macos"))]
 const ORT_LIB_NAME: &str = "libonnxruntime.dylib";
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "deepfilter", target_os = "linux"))]
 const ORT_LIB_NAME: &str = "libonnxruntime.so";
 
 /// Platform suffix used in ONNX Runtime release asset names.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(feature = "deepfilter", target_os = "windows", target_arch = "x86_64"))]
 const ORT_PLATFORM: &str = "win-x64";
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[cfg(all(feature = "deepfilter", target_os = "macos", target_arch = "x86_64"))]
 const ORT_PLATFORM: &str = "osx-x86_64";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "deepfilter", target_os = "macos", target_arch = "aarch64"))]
 const ORT_PLATFORM: &str = "osx-arm64";
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "deepfilter", target_os = "linux", target_arch = "x86_64"))]
 const ORT_PLATFORM: &str = "linux-x64";
 
 /// Resolve the download URL for the latest ONNX Runtime release.
 /// Queries the GitHub API to find the newest version and matching asset.
+#[cfg(feature = "deepfilter")]
 fn resolve_ort_download_url() -> Result<String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("noise-gator")
-        .build()?;
+    let response = ureq::get("https://api.github.com/repos/microsoft/onnxruntime/releases/latest")
+        .header("User-Agent", "noise-gator")
+        .call()
+        .map_err(|e| anyhow!("Failed to query ONNX Runtime releases: {e}"))?;
 
-    let response = client
-        .get("https://api.github.com/repos/microsoft/onnxruntime/releases/latest")
-        .send()
-        .map_err(|e| anyhow!("Failed to query ONNX Runtime releases: {e}"))?
-        .error_for_status()
-        .map_err(|e| anyhow!("GitHub API error: {e}"))?;
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|e| anyhow!("Failed to read GitHub API response: {e}"))?;
 
-    let body = response.text()?;
     let resp: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| anyhow!("Failed to parse GitHub API response: {e}"))?;
 
@@ -174,21 +172,25 @@ fn resolve_ort_download_url() -> Result<String> {
 }
 
 /// Directory where ONNX Runtime library is cached.
+#[cfg(feature = "deepfilter")]
 fn ort_lib_dir() -> PathBuf {
     model_base_dir().join("ort")
 }
 
 /// Full path to the ONNX Runtime shared library.
+#[cfg(feature = "deepfilter")]
 pub fn ort_lib_path() -> PathBuf {
     ort_lib_dir().join(ORT_LIB_NAME)
 }
 
 /// Check if ONNX Runtime is already available.
+#[cfg(feature = "deepfilter")]
 pub fn is_ort_available() -> bool {
     ort_lib_path().exists()
 }
 
 /// Download and extract ONNX Runtime if not already cached.
+#[cfg(feature = "deepfilter")]
 pub fn ensure_onnxruntime() -> Result<PathBuf> {
     let lib_path = ort_lib_path();
 
@@ -200,18 +202,15 @@ pub fn ensure_onnxruntime() -> Result<PathBuf> {
     let url = resolve_ort_download_url()?;
     tracing::info!("Downloading ONNX Runtime from {url}");
 
-    let response = reqwest::blocking::get(&url)
+    let response = ureq::get(&url)
+        .call()
         .map_err(|e| anyhow!("Failed to download ONNX Runtime: {e}"))?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "ONNX Runtime download failed with status: {}",
-            response.status()
-        ));
-    }
-
     let bytes = response
-        .bytes()
+        .into_body()
+        .with_config()
+        .limit(100 * 1024 * 1024) // 100 MB — ORT archive is ~15-20 MB
+        .read_to_vec()
         .map_err(|e| anyhow!("Failed to read ONNX Runtime download: {e}"))?;
 
     let dest = ort_lib_dir();
@@ -236,6 +235,7 @@ pub fn ensure_onnxruntime() -> Result<PathBuf> {
 
 /// Extract the shared library from the ONNX Runtime zip archive.
 /// The zip contains a directory like `onnxruntime-win-x64-1.21.1/lib/onnxruntime.dll`.
+#[cfg(feature = "deepfilter")]
 fn extract_zip_lib(data: &[u8], dest: &Path) -> Result<()> {
     use std::io::Cursor;
 
@@ -267,6 +267,7 @@ fn extract_zip_lib(data: &[u8], dest: &Path) -> Result<()> {
 }
 
 /// Extract the shared library from an ONNX Runtime .tgz archive (macOS/Linux).
+#[cfg(feature = "deepfilter")]
 fn extract_tgz_lib(data: &[u8], dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
@@ -316,4 +317,14 @@ pub fn init_ort() -> Result<()> {
 #[cfg(not(feature = "deepfilter"))]
 pub fn init_ort() -> Result<()> {
     Ok(())
+}
+
+#[cfg(not(feature = "deepfilter"))]
+pub fn ensure_deepfilter_model() -> Result<PathBuf> {
+    Err(anyhow!("DeepFilterNet support not compiled in. Rebuild with --features deepfilter"))
+}
+
+#[cfg(not(feature = "deepfilter"))]
+pub fn is_ort_available() -> bool {
+    false
 }

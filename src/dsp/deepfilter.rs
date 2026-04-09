@@ -16,17 +16,22 @@ mod inner {
     use ort::value::TensorRef;
     use rustfft::{FftPlanner, num_complex::Complex32};
 
-    /// Helper to extract a named output as an owned Vec<f32> with shape info.
-    fn extract_output(
+    /// Extract a named output into pre-allocated buffers (zero heap allocation).
+    fn extract_output_into(
         outputs: &ort::session::SessionOutputs<'_>,
         name: &str,
-    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        shape_buf: &mut Vec<usize>,
+        data_buf: &mut Vec<f32>,
+    ) -> Result<()> {
         let value = outputs
             .get(name)
             .ok_or_else(|| anyhow!("Model missing expected output '{name}'"))?;
         let (shape, data) = value.try_extract_tensor::<f32>()?;
-        let shape_usize: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-        Ok((shape_usize, data.to_vec()))
+        shape_buf.clear();
+        shape_buf.extend(shape.iter().map(|&d| d as usize));
+        data_buf.clear();
+        data_buf.extend_from_slice(data);
+        Ok(())
     }
 
     use super::{ProcessResult, Processor};
@@ -77,29 +82,27 @@ mod inner {
         frame_count: usize,
         // Error tracking
         error_count: usize,
+        // Pre-allocated encoder output buffers (avoids heap alloc per frame)
+        enc_e0_shape: Vec<usize>, enc_e0_data: Vec<f32>,
+        enc_e1_shape: Vec<usize>, enc_e1_data: Vec<f32>,
+        enc_e2_shape: Vec<usize>, enc_e2_data: Vec<f32>,
+        enc_e3_shape: Vec<usize>, enc_e3_data: Vec<f32>,
+        enc_emb_shape: Vec<usize>, enc_emb_data: Vec<f32>,
+        enc_c0_shape: Vec<usize>, enc_c0_data: Vec<f32>,
+        // Pre-allocated decoder output buffers
+        erb_gains: Vec<f32>,
+        df_coefs: Vec<[Complex32; DF_ORDER]>,
     }
 
     // SAFETY: Exclusively owned by a single audio callback closure.
     unsafe impl Send for DeepFilterProcessor {}
 
-    /// Encoder output tensors as owned (shape, data) pairs for passing to decoders.
-    struct EncoderOutput {
-        e0: (Vec<usize>, Vec<f32>),
-        e1: (Vec<usize>, Vec<f32>),
-        e2: (Vec<usize>, Vec<f32>),
-        e3: (Vec<usize>, Vec<f32>),
-        emb: (Vec<usize>, Vec<f32>),
-        c0: (Vec<usize>, Vec<f32>),
-    }
-
-    impl EncoderOutput {
-        /// Create a TensorRef from one of the stored outputs.
-        fn tensor_ref(field: &(Vec<usize>, Vec<f32>)) -> Result<TensorRef<'_, f32>> {
-            Ok(TensorRef::from_array_view(
-                ndarray::ArrayViewD::from_shape(field.0.as_slice(), field.1.as_slice())
-                    .map_err(|e| anyhow!("Shape mismatch: {e}"))?,
-            )?)
-        }
+    /// Create a TensorRef from pre-allocated shape+data buffers.
+    fn tensor_ref_from_bufs<'a>(shape: &'a [usize], data: &'a [f32]) -> Result<TensorRef<'a, f32>> {
+        Ok(TensorRef::from_array_view(
+            ndarray::ArrayViewD::from_shape(shape, data)
+                .map_err(|e| anyhow!("Shape mismatch: {e}"))?,
+        )?)
     }
 
     impl DeepFilterProcessor {
@@ -176,6 +179,16 @@ mod inner {
                 alpha,
                 frame_count: 0,
                 error_count: 0,
+                // Pre-allocated encoder output buffers
+                enc_e0_shape: Vec::with_capacity(4), enc_e0_data: Vec::with_capacity(256),
+                enc_e1_shape: Vec::with_capacity(4), enc_e1_data: Vec::with_capacity(256),
+                enc_e2_shape: Vec::with_capacity(4), enc_e2_data: Vec::with_capacity(256),
+                enc_e3_shape: Vec::with_capacity(4), enc_e3_data: Vec::with_capacity(256),
+                enc_emb_shape: Vec::with_capacity(4), enc_emb_data: Vec::with_capacity(256),
+                enc_c0_shape: Vec::with_capacity(4), enc_c0_data: Vec::with_capacity(256),
+                // Pre-allocated decoder output buffers
+                erb_gains: Vec::with_capacity(NB_ERB),
+                df_coefs: vec![[Complex32::new(0.0, 0.0); DF_ORDER]; NB_DF],
             })
         }
 
@@ -203,25 +216,19 @@ mod inner {
             let erb_feat = self.compute_erb_features();
             let spec_feat = self.compute_spec_features();
 
-            let enc_result = match self.run_encoder(&erb_feat, &spec_feat) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Encoder inference failed: {e}");
-                    frame.copy_from_slice(&self.input_buf[FFT_SIZE - HOP_SIZE..]);
-                    self.error_count += 1;
-                    return;
-                }
-            };
+            if let Err(e) = self.run_encoder(&erb_feat, &spec_feat) {
+                tracing::error!("Encoder inference failed: {e}");
+                frame.copy_from_slice(&self.input_buf[FFT_SIZE - HOP_SIZE..]);
+                self.error_count += 1;
+                return;
+            }
 
-            let erb_gains = match self.run_erb_decoder(&enc_result) {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::error!("ERB decoder failed: {e}");
-                    frame.copy_from_slice(&self.input_buf[FFT_SIZE - HOP_SIZE..]);
-                    self.error_count += 1;
-                    return;
-                }
-            };
+            if let Err(e) = self.run_erb_decoder() {
+                tracing::error!("ERB decoder failed: {e}");
+                frame.copy_from_slice(&self.input_buf[FFT_SIZE - HOP_SIZE..]);
+                self.error_count += 1;
+                return;
+            }
 
             // Save original noisy spectrum for DF buffer BEFORE ERB gains modify it.
             // Deep filtering uses learned filters on the raw noisy signal, not
@@ -230,19 +237,16 @@ mod inner {
             let last = self.df_buf.last_mut().unwrap();
             last[..NB_DF].copy_from_slice(&self.spectrum[..NB_DF]);
 
-            self.apply_erb_gains(&erb_gains);
+            self.apply_erb_gains();
 
-            let df_coefs = match self.run_df_decoder(&enc_result) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("DF decoder failed: {e}");
-                    tracing::warn!("Falling back to ERB-only enhancement");
-                    self.synthesize(frame);
-                    return;
-                }
-            };
+            if let Err(e) = self.run_df_decoder() {
+                tracing::error!("DF decoder failed: {e}");
+                tracing::warn!("Falling back to ERB-only enhancement");
+                self.synthesize(frame);
+                return;
+            }
 
-            self.apply_deep_filtering(&df_coefs);
+            self.apply_deep_filtering();
             self.synthesize(frame);
             self.frame_count += 1;
             self.error_count = 0;
@@ -292,7 +296,7 @@ mod inner {
             &mut self,
             erb: &[f32; NB_ERB],
             spec: &[[f32; 2]; NB_DF],
-        ) -> Result<EncoderOutput> {
+        ) -> Result<()> {
             let erb_array = Array4::from_shape_fn((1, 1, 1, NB_ERB), |(_, _, _, i)| erb[i]);
             let spec_array =
                 Array4::from_shape_fn((1, 2, 1, NB_DF), |(_, ch, _, i)| spec[i][ch]);
@@ -305,36 +309,37 @@ mod inner {
                 "feat_spec" => spec_ref
             ])?;
 
-            Ok(EncoderOutput {
-                e0: extract_output(&outputs, "e0")?,
-                e1: extract_output(&outputs, "e1")?,
-                e2: extract_output(&outputs, "e2")?,
-                e3: extract_output(&outputs, "e3")?,
-                emb: extract_output(&outputs, "emb")?,
-                c0: extract_output(&outputs, "c0")?,
-            })
+            extract_output_into(&outputs, "e0", &mut self.enc_e0_shape, &mut self.enc_e0_data)?;
+            extract_output_into(&outputs, "e1", &mut self.enc_e1_shape, &mut self.enc_e1_data)?;
+            extract_output_into(&outputs, "e2", &mut self.enc_e2_shape, &mut self.enc_e2_data)?;
+            extract_output_into(&outputs, "e3", &mut self.enc_e3_shape, &mut self.enc_e3_data)?;
+            extract_output_into(&outputs, "emb", &mut self.enc_emb_shape, &mut self.enc_emb_data)?;
+            extract_output_into(&outputs, "c0", &mut self.enc_c0_shape, &mut self.enc_c0_data)?;
+            Ok(())
         }
 
-        fn run_erb_decoder(&mut self, enc: &EncoderOutput) -> Result<Vec<f32>> {
+        fn run_erb_decoder(&mut self) -> Result<()> {
             let outputs = self.erb_decoder.run(ort::inputs![
-                "emb" => EncoderOutput::tensor_ref(&enc.emb)?,
-                "e3" => EncoderOutput::tensor_ref(&enc.e3)?,
-                "e2" => EncoderOutput::tensor_ref(&enc.e2)?,
-                "e1" => EncoderOutput::tensor_ref(&enc.e1)?,
-                "e0" => EncoderOutput::tensor_ref(&enc.e0)?
+                "emb" => tensor_ref_from_bufs(&self.enc_emb_shape, &self.enc_emb_data)?,
+                "e3" => tensor_ref_from_bufs(&self.enc_e3_shape, &self.enc_e3_data)?,
+                "e2" => tensor_ref_from_bufs(&self.enc_e2_shape, &self.enc_e2_data)?,
+                "e1" => tensor_ref_from_bufs(&self.enc_e1_shape, &self.enc_e1_data)?,
+                "e0" => tensor_ref_from_bufs(&self.enc_e0_shape, &self.enc_e0_data)?
             ])?;
 
             let value = outputs
                 .get("m")
                 .ok_or_else(|| anyhow!("ERB decoder missing output 'm'"))?;
             let (_, gains) = value.try_extract_tensor::<f32>()?;
-            Ok(gains.to_vec())
+            self.erb_gains.clear();
+            self.erb_gains.extend_from_slice(gains);
+            Ok(())
         }
 
-        fn run_df_decoder(&mut self, enc: &EncoderOutput) -> Result<Vec<[Complex32; DF_ORDER]>> {
+        fn run_df_decoder(&mut self) -> Result<()> {
             let outputs = self.df_decoder.run(ort::inputs![
-                "emb" => EncoderOutput::tensor_ref(&enc.emb)?,
-                "c0" => EncoderOutput::tensor_ref(&enc.c0)?
+                "emb" => tensor_ref_from_bufs(&self.enc_emb_shape, &self.enc_emb_data)?,
+                "c0" => tensor_ref_from_bufs(&self.enc_c0_shape, &self.enc_c0_data)?
             ])?;
 
             let value = outputs
@@ -342,25 +347,24 @@ mod inner {
                 .ok_or_else(|| anyhow!("DF decoder missing output 'coefs'"))?;
             let (_, raw) = value.try_extract_tensor::<f32>()?;
 
-            let mut coefs = Vec::with_capacity(NB_DF);
             for i in 0..NB_DF {
-                let mut c = [Complex32::new(0.0, 0.0); DF_ORDER];
                 for j in 0..DF_ORDER {
                     let idx = (i * DF_ORDER + j) * 2;
                     if idx + 1 < raw.len() {
-                        c[j] = Complex32::new(raw[idx], raw[idx + 1]);
+                        self.df_coefs[i][j] = Complex32::new(raw[idx], raw[idx + 1]);
+                    } else {
+                        self.df_coefs[i][j] = Complex32::new(0.0, 0.0);
                     }
                 }
-                coefs.push(c);
             }
-            Ok(coefs)
+            Ok(())
         }
 
-        fn apply_erb_gains(&mut self, gains: &[f32]) {
+        fn apply_erb_gains(&mut self) {
             let mut bin = 0usize;
             for (band, &width) in ERB_WIDTHS.iter().enumerate() {
-                let g = if band < gains.len() {
-                    gains[band].clamp(0.0, 1.0)
+                let g = if band < self.erb_gains.len() {
+                    self.erb_gains[band].clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
@@ -373,15 +377,15 @@ mod inner {
             }
         }
 
-        fn apply_deep_filtering(&mut self, coefs: &[[Complex32; DF_ORDER]]) {
+        fn apply_deep_filtering(&mut self) {
             // df_buf is already populated (before ERB gains) with the noisy spectrum.
-            // coefs[bin][0] applies to the newest frame (last in df_buf),
-            // coefs[bin][DF_ORDER-1] applies to the oldest.
+            // df_coefs[bin][0] applies to the newest frame (last in df_buf),
+            // df_coefs[bin][DF_ORDER-1] applies to the oldest.
             let last_idx = DF_ORDER - 1;
             for i in 0..NB_DF {
                 let mut sum = Complex32::new(0.0, 0.0);
                 for j in 0..DF_ORDER {
-                    sum += coefs[i][j] * self.df_buf[last_idx - j][i];
+                    sum += self.df_coefs[i][j] * self.df_buf[last_idx - j][i];
                 }
                 self.spectrum[i] = sum;
             }

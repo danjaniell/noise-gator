@@ -13,8 +13,6 @@ mod ui;
 
 use std::sync::Arc;
 
-use clap::Parser;
-
 use audio::device;
 use audio::pipeline::Pipeline;
 use config::cli::Cli;

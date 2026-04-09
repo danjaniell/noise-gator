@@ -23,3 +23,13 @@ pub struct ProcessResult {
     pub vad: Option<f32>,
 }
 
+/// Convert a time constant in ms to a one-pole smoothing coefficient at 48kHz.
+/// coeff = exp(-1 / (time_ms * sample_rate / 1000))
+pub fn time_to_coeff(ms: f32) -> f32 {
+    const SAMPLE_RATE: f32 = 48_000.0;
+    if ms <= 0.0 {
+        return 0.0;
+    }
+    (-1.0 / (ms * SAMPLE_RATE / 1000.0)).exp()
+}
+

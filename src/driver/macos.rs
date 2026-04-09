@@ -25,15 +25,15 @@ pub fn install() -> Result<()> {
     let tmp_pkg = "/tmp/BlackHole2ch.pkg";
 
     tracing::info!("Downloading BlackHole virtual audio driver...");
-    let response = reqwest::blocking::get(BLACKHOLE_URL)
+    let response = ureq::get(BLACKHOLE_URL)
+        .call()
         .map_err(|e| anyhow!("Failed to download BlackHole: {e}"))?;
 
-    if !response.status().is_success() {
-        return Err(anyhow!("Download failed: {}", response.status()));
-    }
-
     let bytes = response
-        .bytes()
+        .into_body()
+        .with_config()
+        .limit(100 * 1024 * 1024) // 100 MB limit for .pkg
+        .read_to_vec()
         .map_err(|e| anyhow!("Failed to read download: {e}"))?;
     std::fs::write(tmp_pkg, &bytes).map_err(|e| anyhow!("Failed to write pkg: {e}"))?;
 

@@ -31,12 +31,11 @@ muda = "0.17"
 # Event loop for tray (cross-platform)
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
 
-# CLI argument parsing
-clap = { version = "4", features = ["derive"] }
+# CLI argument parsing (tiny, no proc-macro)
+pico-args = "0.5"
 
 # Config file
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 toml = "0.8"
 
 # Error handling
@@ -47,8 +46,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# HTTP client for driver download (native-tls avoids ring/gcc dependency)
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
+# HTTP client for downloads (lightweight blocking client, no async runtime)
+ureq = { version = "3", features = ["native-tls"] }
 
 # Ctrl+C handling for headless mode
 ctrlc = "3"
@@ -61,13 +60,16 @@ ndarray = { version = "0.16", optional = true }
 # SHA256 hash verification for downloaded model files
 sha2 = { version = "0.10", optional = true }
 
-# Archive extraction for model downloads
-flate2 = "1"
-tar = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# Archive extraction for model downloads (only needed for deepfilter model/ORT download)
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
-# PNG decoding for tray icon
-image = { version = "0.25", default-features = false, features = ["png"] }
+# JSON parsing for GitHub API (only needed for ORT download)
+serde_json = { version = "1", optional = true }
+
+# PNG decoding for tray icon (lightweight, no full image crate)
+png = "0.18"
 
 # Settings window GUI (egui rendered via glow into a glutin-managed GL context)
 egui = { version = "0.31", features = ["default_fonts"] }
@@ -92,7 +94,7 @@ windows = { version = "0.62", features = [
 
 [features]
 default = ["deepfilter"]
-deepfilter = ["dep:ort", "dep:rustfft", "dep:ndarray", "dep:sha2"]
+deepfilter = ["dep:ort", "dep:rustfft", "dep:ndarray", "dep:sha2", "dep:flate2", "dep:tar", "dep:zip", "dep:serde_json"]
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -102,6 +104,7 @@ opt-level = 3
 lto = true
 strip = true
 codegen-units = 1
+panic = "abort"
 
 # Fast optimized build for local testing (no LTO)
 # Usage: cargo build --profile dev-release

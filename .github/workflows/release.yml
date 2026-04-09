@@ -9,8 +9,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
   resolve-tag:
@@ -48,9 +46,9 @@ jobs:
             platform: windows
             zip_name: noise-gator-windows.zip
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin
             artifact: noise-gator
-            ort_platform: osx-x86_64
+            ort_platform: osx-arm64
             ort_ext: tgz
             ort_lib: libonnxruntime.dylib
             platform: macos
@@ -69,16 +67,10 @@ jobs:
           toolchain: "1.85"
           targets: ${{ matrix.target }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ matrix.platform }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.platform }}-cargo-release-
+          prefix-key: "v1-rust"
+          key: "release-${{ matrix.platform }}"
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }} --verbose
@@ -93,6 +85,7 @@ jobs:
           ort_lib: ${{ matrix.ort_lib }}
           platform: ${{ matrix.platform }}
           zip_name: ${{ matrix.zip_name }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5

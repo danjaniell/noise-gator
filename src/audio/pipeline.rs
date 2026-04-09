@@ -275,7 +275,7 @@ impl Pipeline {
         let mut autogain = AutoGain::new(autogain_settings);
 
         let max_accum = FRAME_SIZE * 4;
-        let mut accumulator: Vec<f32> = Vec::with_capacity(max_accum);
+        let mut accumulator: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(max_accum);
         let mut resample_buf: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 2);
 
         // Pre-allocated mono downmix buffer — avoids heap allocation in audio callback.
@@ -319,12 +319,8 @@ impl Pipeline {
 
                 // 2. Resample to 48 kHz via sinc resampler (if needed).
                 // When no resample needed, use mono slice directly — zero allocation.
-                let resampled;
                 let at_48k: &[f32] = match input_resampler {
-                    Some(ref mut resampler) => {
-                        resampled = resampler.process(mono);
-                        &resampled
-                    }
+                    Some(ref mut resampler) => resampler.process(mono),
                     None => mono,
                 };
 
@@ -336,32 +332,39 @@ impl Pipeline {
                 }
 
                 // 4. Accumulate for FRAME_SIZE processing
-                accumulator.extend_from_slice(at_48k);
+                accumulator.extend(at_48k.iter().copied());
                 if accumulator.len() > max_accum {
                     let excess = accumulator.len() - max_accum;
-                    accumulator.drain(..excess);
+                    accumulator.drain(..excess);  // O(1) for VecDeque front-drain
                 }
 
                 // 5. Process complete frames
-                // Pick up live setting changes (once per callback, not per frame)
-                // Gate enabled/disabled is now controlled by gate_floor (1.0 = bypass).
-                // hard_mode atomic is retained for config compat but no longer drives set_enabled.
-                let gate_floor = f32::from_bits(
-                    input_settings.gate_floor.load(Ordering::Relaxed),
-                );
-                gate.set_enabled(gate_floor < 1.0);
-                gate.update_settings(input_settings.load_gate_settings());
-                eq.update_settings(input_settings.load_eq_settings());
-                autogain.update_settings(input_settings.load_autogain_settings());
+                // Pick up live setting changes only when dirty (avoids ~13 atomic
+                // loads per callback when nothing changed).
+                if input_settings.settings_dirty.swap(false, Ordering::Relaxed) {
+                    let gate_floor = f32::from_bits(
+                        input_settings.gate_floor.load(Ordering::Relaxed),
+                    );
+                    gate.set_enabled(gate_floor < 1.0);
+                    gate.update_settings(input_settings.load_gate_settings());
+                    eq.update_settings(input_settings.load_eq_settings());
+                    autogain.update_settings(input_settings.load_autogain_settings());
+                }
                 let suppression = f32::from_bits(
                     input_settings.suppression_level.load(Ordering::Relaxed),
                 );
 
-                let mut read_pos = 0;
-                while read_pos + FRAME_SIZE <= accumulator.len() {
+                while accumulator.len() >= FRAME_SIZE {
                     let mut frame = [0f32; FRAME_SIZE];
-                    frame.copy_from_slice(&accumulator[read_pos..read_pos + FRAME_SIZE]);
-                    read_pos += FRAME_SIZE;
+                    // VecDeque may be split across two slices; copy both parts
+                    let (front, back) = accumulator.as_slices();
+                    if front.len() >= FRAME_SIZE {
+                        frame.copy_from_slice(&front[..FRAME_SIZE]);
+                    } else {
+                        frame[..front.len()].copy_from_slice(front);
+                        frame[front.len()..FRAME_SIZE].copy_from_slice(&back[..FRAME_SIZE - front.len()]);
+                    }
+                    accumulator.drain(..FRAME_SIZE);
 
                     // Pre-filter: remove low-freq rumble before denoise
                     highpass.process(&mut frame);
@@ -455,9 +458,7 @@ impl Pipeline {
                     }
                 }
 
-                if read_pos > 0 {
-                    accumulator.drain(..read_pos);
-                }
+                // Accumulator is drained per-frame inside the loop above
         };
 
         let err_callback = {
@@ -477,8 +478,9 @@ impl Pipeline {
                     &in_cfg,
                     move |data: &[i16], _| {
                         // Convert I16 → F32 (range -1.0..1.0)
+                        const I16_SCALE: f32 = 1.0 / i16::MAX as f32;
                         i16_conv_buf.clear();
-                        i16_conv_buf.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
+                        i16_conv_buf.extend(data.iter().map(|&s| s as f32 * I16_SCALE));
                         process_audio(&i16_conv_buf);
                     },
                     err_callback,

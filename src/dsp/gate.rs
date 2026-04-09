@@ -1,4 +1,4 @@
-use super::{ProcessResult, Processor};
+use super::{ProcessResult, Processor, time_to_coeff};
 
 /// Configurable VAD-based noise gate with proper attack/release/hold envelope.
 ///
@@ -53,15 +53,6 @@ impl Default for GateSettings {
 }
 
 const SAMPLE_RATE: f32 = 48_000.0;
-
-/// Convert a time constant in ms to a one-pole smoothing coefficient.
-/// coeff = exp(-1 / (time_ms * sample_rate / 1000))
-fn time_to_coeff(ms: f32) -> f32 {
-    if ms <= 0.0 {
-        return 0.0;
-    }
-    (-1.0 / (ms * SAMPLE_RATE / 1000.0)).exp()
-}
 
 impl NoiseGate {
     #[allow(dead_code)]

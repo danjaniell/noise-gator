@@ -21,34 +21,12 @@ jobs:
         with:
           toolchain: "1.85"
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-        continue-on-error: true
-        id: sccache
-
-      - name: Enable sccache wrapper
-        if: steps.sccache.outcome == 'success'
-        shell: bash
-        run: |
-          export SCCACHE_GHA_ENABLED=true
-          if sccache --start-server 2>/dev/null && sccache --show-stats >/dev/null 2>&1; then
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::sccache server failed to start — building without cache"
-            sccache --stop-server 2>/dev/null || true
-          fi
-
-      - uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-cargo-
+          prefix-key: "v1-rust"
 
-      - name: Build
-        run: cargo build --verbose
+      - name: Check
+        run: cargo check --verbose
 
       - name: Run tests
         run: cargo test --verbose
@@ -69,50 +47,24 @@ jobs:
         with:
           toolchain: "1.85"
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-        continue-on-error: true
-        id: sccache
-
-      - name: Enable sccache wrapper
-        if: steps.sccache.outcome == 'success'
-        shell: bash
-        run: |
-          export SCCACHE_GHA_ENABLED=true
-          if sccache --start-server 2>/dev/null && sccache --show-stats >/dev/null 2>&1; then
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::sccache server failed to start — building without cache"
-            sccache --stop-server 2>/dev/null || true
-          fi
-
-      - uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: linux-cargo-
+          prefix-key: "v1-rust"
 
       - name: Check (no default features)
         run: cargo check --no-default-features --verbose
 
-  tag:
+  resolve-version:
     needs: [ build-windows, check-linux ]
     if: github.ref == 'refs/heads/master' && github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       version: ${{ steps.next.outputs.next }}
-      tagged: ${{ steps.commit.outputs.tagged }}
 
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Read version from Cargo.toml
         id: version
@@ -141,47 +93,8 @@ jobs:
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
           echo "Next version: $NEXT"
 
-      - name: Update Cargo.toml version
-        run: |
-          NEXT="${{ steps.next.outputs.next }}"
-          sed -i "0,/^version = .*/s//version = \"${NEXT}\"/" Cargo.toml
-          echo "Cargo.toml updated to $NEXT"
-          head -5 Cargo.toml
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.85"
-
-      - name: Update Cargo.lock
-        run: cargo update --package noise-gator
-
-      - name: Commit and tag
-        id: commit
-        run: |
-          NEXT="${{ steps.next.outputs.next }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-
-          # Commit version bump if there are changes
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: bump version to ${NEXT} [skip ci]"
-          fi
-
-          # Always tag + push if the tag doesn't already exist
-          if git rev-parse "v${NEXT}" >/dev/null 2>&1; then
-            echo "Tag v${NEXT} already exists, skipping"
-            echo "tagged=false" >> "$GITHUB_OUTPUT"
-          else
-            git tag "v${NEXT}"
-            git push origin master --tags
-            echo "tagged=true" >> "$GITHUB_OUTPUT"
-          fi
-
   release-build:
-    needs: tag
-    if: needs.tag.outputs.tagged == 'true'
+    needs: resolve-version
     strategy:
       fail-fast: false
       matrix:
@@ -207,8 +120,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: v${{ needs.tag.outputs.version }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -216,31 +127,10 @@ jobs:
           toolchain: "1.85"
           targets: ${{ matrix.target }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-        continue-on-error: true
-        id: sccache
-
-      - name: Enable sccache wrapper
-        if: steps.sccache.outcome == 'success'
-        shell: bash
-        run: |
-          export SCCACHE_GHA_ENABLED=true
-          if sccache --start-server 2>/dev/null && sccache --show-stats >/dev/null 2>&1; then
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::sccache server failed to start — building without cache"
-            sccache --stop-server 2>/dev/null || true
-          fi
-
-      - uses: actions/cache@v5
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ matrix.platform }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.platform }}-cargo-release-
+          prefix-key: "v1-rust"
+          key: "release-${{ matrix.platform }}"
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }} --verbose
@@ -255,6 +145,7 @@ jobs:
           ort_lib: ${{ matrix.ort_lib }}
           platform: ${{ matrix.platform }}
           zip_name: ${{ matrix.zip_name }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -263,23 +154,57 @@ jobs:
           path: ${{ matrix.zip_name }}
 
   create-release:
-    needs: [ tag, release-build ]
+    needs: [ resolve-version, release-build ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump version, tag, and push
+        id: tag
+        run: |
+          NEXT="${{ needs.resolve-version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Update Cargo.toml version
+          sed -i "0,/^version = .*/s//version = \"${NEXT}\"/" Cargo.toml
+
+          # Install Rust toolchain for Cargo.lock update
+          rustup default 1.85
+          cargo update --package noise-gator
+
+          git add Cargo.toml Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump version to ${NEXT} [skip ci]"
+          fi
+
+          if git rev-parse "v${NEXT}" >/dev/null 2>&1; then
+            echo "Tag v${NEXT} already exists, skipping"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          else
+            git tag "v${NEXT}"
+            git push origin master --tags
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v5
+        if: steps.tag.outputs.tagged == 'true'
         with:
           path: artifacts
 
       - name: Create GitHub Release
+        if: steps.tag.outputs.tagged == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ needs.tag.outputs.version }}"
+          TAG="v${{ steps.tag.outputs.version }}"
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
